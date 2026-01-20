@@ -1,0 +1,30 @@
+# 测试文件
+test_output_result.json
+test_kafka_message.py
+test_kafka_message.json
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 临时文件
+temp/
+*.csv
+!train_pipeline_v5_kfold.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
