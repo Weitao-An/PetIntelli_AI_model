@@ -49,7 +49,9 @@ READ_COLS = [
 FEATURE_COLS = READ_COLS + ["v_acc_mag"]
 
 # Kafka 配置
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+# 注意：如果 Kafka 在 Docker 容器中运行，且配置了 EXTERNAL 监听器（9094），应使用 9094 端口
+# 如果使用 INTERNAL 监听器（9092），需要确保 advertised address 正确配置
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9094")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "imu_data_topic")
 KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "ai_model_service_group")
 
