@@ -61,6 +61,14 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB = int(os.getenv("REDIS_DB", 0))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 
+# # Redis 配置（支持环境变量）
+# REDIS_HOST = os.getenv("REDIS_HOST", "47.97.19.58")
+# REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+# REDIS_DB = int(os.getenv("REDIS_DB", 0))
+# REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "petpypkj2025")  # 从环境变量读取，生产环境必须设置
+# REDIS_DECODE = os.getenv("REDIS_DECODE", "True").lower() == "true"  # 是否自动 decode
+
+
 # --- 2. 模型定义 ---
 class SEBlock(nn.Module):
     def __init__(self, channels: int, reduction: int = 16):
