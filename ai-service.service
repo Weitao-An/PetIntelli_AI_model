@@ -1,0 +1,37 @@
+[Unit]
+Description=AI Model Service - Redis Stream Consumer
+Documentation=https://github.com/your-repo/ai-service
+After=network.target redis.service
+Requires=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/ai_service
+Environment="ENV=prod"
+Environment="REDIS_HOST=47.97.19.58"
+Environment="REDIS_PORT=6379"
+Environment="REDIS_DB=0"
+Environment="REDIS_PASSWORD=petpypkj2025"
+Environment="REDIS_DECODE=False"
+Environment="ARTIFACTS_DIR=/opt/ai_service/artifacts"
+Environment="TEMP_DIR=/opt/ai_service/temp"
+Environment="LOG_LEVEL=INFO"
+ExecStart=/opt/ai_service/venv/bin/python3 /opt/ai_service/ai_service.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# 资源限制（根据实际情况调整）
+LimitNOFILE=65536
+MemoryLimit=4G
+
+# 安全设置（可选）
+# PrivateTmp=true
+# NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+

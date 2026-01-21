@@ -3,20 +3,15 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 import json
-import asyncio
 import logging
 import pickle
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import time
 from typing import List, Any, Optional, Dict
-from kafka import KafkaConsumer
-from kafka.errors import KafkaError
 import redis
 from datetime import datetime
 from pathlib import Path
 import os
 import tempfile
-import subprocess
 
 # 配置日志
 logging.basicConfig(
@@ -24,8 +19,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-app = FastAPI(title="IMU 动态形状推理服务")
 
 # --- 1. 配置参数 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -48,25 +41,28 @@ READ_COLS = [
 ]
 FEATURE_COLS = READ_COLS + ["v_acc_mag"]
 
-# Kafka 配置
-# 注意：如果 Kafka 在 Docker 容器中运行，且配置了 EXTERNAL 监听器（9094），应使用 9094 端口
-# 如果使用 INTERNAL 监听器（9092），需要确保 advertised address 正确配置
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9094")
-KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "imu_data_topic")
-KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "ai_model_service_group")
+# --- 环境配置（参考 constants.py 规范）---
+ENV = os.getenv("ENV", "dev")  # 环境标识：dev/test/prod
 
-# Redis 配置
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+# Redis 配置（与 web 端保持一致）
+REDIS_HOST = os.getenv("REDIS_HOST", "47.97.19.58")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB = int(os.getenv("REDIS_DB", 0))
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "petpypkj2025")  # 从环境变量读取，生产环境必须设置
+REDIS_DECODE = os.getenv("REDIS_DECODE", "True").lower() == "true"  # 是否自动 decode
+REDIS_RECONNECT_DELAY = int(os.getenv("REDIS_RECONNECT_DELAY", 5))  # 重连延迟（秒）
 
-# # Redis 配置（支持环境变量）
-# REDIS_HOST = os.getenv("REDIS_HOST", "47.97.19.58")
-# REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-# REDIS_DB = int(os.getenv("REDIS_DB", 0))
-# REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "petpypkj2025")  # 从环境变量读取，生产环境必须设置
-# REDIS_DECODE = os.getenv("REDIS_DECODE", "True").lower() == "true"  # 是否自动 decode
+# Redis Key 前缀（按规范：pi:{env}）
+REDIS_KEY_PREFIX = f"pi:{ENV}"
+
+# Redis Stream 配置
+REDIS_STREAM_TELEMETRY = f"{REDIS_KEY_PREFIX}:stream:telemetry"  # 遥测数据流
+REDIS_STREAM_CONSUMER_GROUP = "ai_service"  # 消费者组名称
+REDIS_STREAM_CONSUMER_NAME = f"ai_worker_{os.getpid()}"  # 消费者名称（使用进程ID）
+
+# Redis Key 模板
+REDIS_KEY_DEV_LATEST = f"{REDIS_KEY_PREFIX}:dev:{{nfc_uid}}:latest"  # Hash Key
+REDIS_PUB_CHANNEL = f"{REDIS_KEY_PREFIX}:pub:{{nfc_uid}}"  # Pub/Sub 频道
 
 
 # --- 2. 模型定义 ---
@@ -408,369 +404,404 @@ def perform_inference_from_csv(csv_path: Path) -> Dict[str, Any]:
             "error": error_msg
         }
 
-# --- 6. 初始化 Redis 客户端 ---
-redis_client = None
-try:
-    redis_client = redis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        password=REDIS_PASSWORD,
-        decode_responses=True,
-        socket_connect_timeout=5
-    )
-    # 测试连接
-    redis_client.ping()
-    logger.info(f"成功连接到 Redis: {REDIS_HOST}:{REDIS_PORT}")
-except Exception as e:
-    logger.warning(f"Redis 连接失败: {e}，将无法写入Redis，但服务将继续运行")
-    redis_client = None
-
-# --- 7. 将结果写入 Redis ---
-def write_to_redis(key: str, data: dict):
+# --- 6. Emotion 处理函数（暂时 Mock）---
+def process_emotion(emotion_sound_osslink: str) -> dict:
     """
-    将数据写入 Redis
+    处理 emotion 数据（暂时使用 Mock 返回）
     
     Args:
-        key: Redis键
-        data: 要写入的数据字典
+        emotion_sound_osslink: 音频链接
+        
+    Returns:
+        包含 emotion 结果的字典
     """
-    if redis_client is None:
-        logger.warning(f"Redis未连接，跳过写入 - Key: {key}")
-        return
+    # TODO: 后续接入真实的 emotion 模块
+    logger.debug(f"处理 emotion - OSS Link: {emotion_sound_osslink}")
+    return {
+        "emotion": "calm",
+        "score": 80
+    }
+
+# --- 7. Redis 客户端管理 ---
+def create_redis_client():
+    """
+    创建 Redis 客户端
+    
+    Returns:
+        Redis 客户端对象，如果连接失败则返回 None
+    """
+    try:
+        client = redis.Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            db=REDIS_DB,
+            password=REDIS_PASSWORD,
+            decode_responses=REDIS_DECODE,  # 根据配置决定是否自动 decode（Stream 操作通常需要 False）
+            socket_connect_timeout=5,
+            socket_keepalive=True,
+            socket_keepalive_options={}
+        )
+        # 测试连接
+        client.ping()
+        logger.info(f"成功连接到 Redis: {REDIS_HOST}:{REDIS_PORT}")
+        return client
+    except Exception as e:
+        logger.error(f"Redis 连接失败: {e}")
+        return None
+
+def ensure_consumer_group(client: redis.Redis, stream_name: str, group_name: str):
+    """
+    确保 Consumer Group 存在，如果不存在则创建
+    
+    Args:
+        client: Redis 客户端
+        stream_name: Stream 名称
+        group_name: Consumer Group 名称
+    """
+    try:
+        # 尝试创建 Consumer Group（从 0 开始读取）
+        client.xgroup_create(
+            name=stream_name,
+            groupname=group_name,
+            id="0",  # 从 Stream 开始读取
+            mkstream=True  # 如果 Stream 不存在则创建
+        )
+        logger.info(f"创建 Consumer Group: {group_name} for Stream: {stream_name}")
+    except redis.ResponseError as e:
+        if "BUSYGROUP" in str(e):
+            # Consumer Group 已存在，这是正常的
+            logger.debug(f"Consumer Group 已存在: {group_name}")
+        else:
+            logger.error(f"创建 Consumer Group 失败: {e}")
+            raise
+
+# --- 8. 将结果写入 Redis Hash ---
+def update_redis_hash_latest(client: redis.Redis, nfc_uid: str, ai_result: dict):
+    """
+    更新 Redis Hash Key pi:{env}:dev:{nfc_uid}:latest
+    
+    Args:
+        client: Redis 客户端
+        nfc_uid: NFC UID
+        ai_result: AI 处理结果字典（包含 emotion_state, emotion_score 等字段）
+        
+    Returns:
+        是否成功
+    """
+    if client is None:
+        logger.warning(f"Redis未连接，跳过写入 Hash - NFC UID: {nfc_uid}")
+        return False
     
     try:
-        # 将结果序列化为JSON字符串
-        result_json = json.dumps(data, ensure_ascii=False)
+        # 构建 Redis Hash Key: pi:{env}:dev:{nfc_uid}:latest
+        redis_key = REDIS_KEY_DEV_LATEST.format(nfc_uid=nfc_uid)
         
-        # 写入Redis
-        redis_client.set(key, result_json)
+        # 将 AI 结果字段写入 Hash
+        # 只更新 AI 相关的字段，保留其他字段
+        hash_data = {}
+        if "emotion_state" in ai_result:
+            hash_data["emotion_state"] = str(ai_result["emotion_state"])
+        if "emotion_score" in ai_result:
+            hash_data["emotion_score"] = str(ai_result["emotion_score"])
+        if "emotion_message" in ai_result:
+            hash_data["emotion_message"] = str(ai_result["emotion_message"])
+        if "action" in ai_result:
+            hash_data["action"] = str(ai_result["action"])
+        if "action_confidence" in ai_result:
+            hash_data["action_confidence"] = str(ai_result["action_confidence"])
+        if "inference_timestamp" in ai_result:
+            hash_data["inference_timestamp"] = str(ai_result["inference_timestamp"])
         
-        # 设置过期时间（例如1小时）
-        redis_client.expire(key, 3600)
-        
-        logger.info(f"结果已写入 Redis - Key: {key}")
+        if hash_data:
+            client.hset(redis_key, mapping=hash_data)
+            # 设置过期时间（24小时，参考 constants.py 的 TTL_LATEST）
+            client.expire(redis_key, 24 * 60 * 60)
+            logger.info(f"更新 Redis Hash - Key: {redis_key}, Fields: {list(hash_data.keys())}")
+            return True
+        else:
+            logger.warning(f"没有 AI 结果字段需要更新 - NFC UID: {nfc_uid}")
+            return False
         
     except Exception as e:
-        logger.error(f"写入 Redis 失败 - Key: {key}, Error: {e}")
+        logger.error(f"更新 Redis Hash 失败 - NFC UID: {nfc_uid}, Error: {e}")
+        return False
 
-# --- 8. Kafka 消费者处理函数 ---
-def process_kafka_message(message):
+# --- 9. 发布结果到 Pub/Sub ---
+def publish_ai_result(client: redis.Redis, nfc_uid: str, ai_result: dict):
     """
-    处理从Kafka接收到的消息
-    
-    期望的JSON格式（从Kafka）：
-    {
-        "ts_last": "1735123456789",
-        "ts_rx": "1735123456789",
-        "battery": 85,
-        "online": 1,
-        "gps_lat_e7": "350000123",
-        "gps_lon_e7": "1390000456",
-        "temp_x100": "2530",
-        "heartRate": 95,
-        "respiratoryRate": 22,
-        "steps": 156,
-        "calorie": 78,
-        "imu_data": [
-            {"sequence": 0, "timestamp": 0.0, "acc_x": ..., "acc_y": ..., "acc_z": ..., "gyro_x": ..., "gyro_y": ..., "gyro_z": ...},
-            ...
-        ],
-        "emotion_sound_osslink": "xxxxxxxxxxxx",  // 暂时忽略
-        "isOutdoor": 1,
-        "endurance": 1224,
-        "lastCharge": "2024/12/20 14:30",
-        "uploadMode": 1,
-        "isBuzzing": 0,
-        "isVibrating": 0,
-        "isFlashing": 0,
-        "last_event_code": 5,
-        "last_event_ts_ms": "1735123456788",
-        ...其他字段...
-    }
-    
-    处理后发送到Redis的JSON格式：
-    {
-        // 保留所有原始字段（除了imu_data和emotion_sound_osslink）
-        "ts_last": "1735123456789",
-        "ts_rx": "1735123456789",
-        "battery": 85,
-        ...所有其他原始字段...
-        "action": "缓慢走动",  // 新增：从imu_data处理得到
-        "action_confidence": 0.6935,  // 新增：置信度
-        "inference_timestamp": "2024-01-01T00:00:00"  // 新增：推理时间戳
-    }
+    通过 Pub/Sub 频道发布 AI 结果
     
     Args:
-        message: Kafka消息对象
+        client: Redis 客户端
+        nfc_uid: NFC UID
+        ai_result: AI 处理结果字典
+        
+    Returns:
+        是否成功
+    """
+    if client is None:
+        logger.warning(f"Redis未连接，跳过发布 - NFC UID: {nfc_uid}")
+        return False
+    
+    try:
+        # 构建 Pub/Sub 频道: pi:{env}:pub:{nfc_uid}
+        channel = REDIS_PUB_CHANNEL.format(nfc_uid=nfc_uid)
+        
+        # 将结果序列化为JSON字符串
+        message_json = json.dumps(ai_result, ensure_ascii=False)
+        
+        # 发布消息
+        client.publish(channel, message_json)
+        
+        logger.info(f"发布 AI 结果到 Pub/Sub - Channel: {channel}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"发布 Pub/Sub 消息失败 - NFC UID: {nfc_uid}, Error: {e}")
+        return False
+
+# --- 10. 处理 Stream 消息数据 ---
+def process_stream_message(message_data: dict) -> dict:
+    """
+    处理从 Redis Stream 获取的消息数据
+    
+    Args:
+        message_data: Stream 消息数据字典（包含 nfc_uid, imu_data 等字段）
+        
+    Returns:
+        AI 处理结果字典（包含 emotion_state, emotion_score, action 等字段）
     """
     try:
-        # 解析JSON消息
-        message_value = message.value.decode('utf-8') if isinstance(message.value, bytes) else message.value
-        original_data = json.loads(message_value)
+        # 解析消息中的字段
+        nfc_uid = message_data.get("nfc_uid", "unknown")
+        imu_data_raw = message_data.get("imu_data", [])
+        emotion_sound_osslink = message_data.get("emotion_sound_osslink", "")
         
-        # 提取设备ID（可能从不同字段获取）
-        device_id = original_data.get("device_id") or original_data.get("deviceId") or "unknown"
-        imu_data = original_data.get("imu_data", [])
+        logger.info(f"开始处理 Stream 消息 - NFC UID: {nfc_uid}, IMU数据点数: {len(imu_data_raw) if isinstance(imu_data_raw, list) else 0}")
         
+        # 解析 imu_data（可能是 JSON 字符串）
+        imu_data = []
+        if isinstance(imu_data_raw, str):
+            try:
+                imu_data = json.loads(imu_data_raw)
+            except json.JSONDecodeError:
+                logger.error(f"IMU数据JSON解析失败 - NFC UID: {nfc_uid}")
+                imu_data = []
+        elif isinstance(imu_data_raw, list):
+            imu_data = imu_data_raw
+        
+        # 初始化结果字典
+        ai_result = {
+            "nfc_uid": nfc_uid,
+            "inference_timestamp": datetime.now().isoformat()
+        }
+        
+        # 1. 处理 Emotion（暂时使用 Mock）
+        try:
+            emotion_result = process_emotion(emotion_sound_osslink)
+            ai_result["emotion_state"] = emotion_result.get("emotion", "calm")
+            ai_result["emotion_score"] = emotion_result.get("score", 80)
+            ai_result["emotion_message"] = f"宠物状态{emotion_result.get('emotion', 'calm')}，情绪评分{emotion_result.get('score', 80)}。"
+        except Exception as e:
+            logger.error(f"Emotion 处理失败 - NFC UID: {nfc_uid}, Error: {e}")
+            ai_result["emotion_state"] = "error"
+            ai_result["emotion_score"] = 0
+            ai_result["emotion_message"] = f"Emotion 处理失败: {str(e)}"
+        
+        # 2. 处理 IMU 数据（Action 推理）
         if not imu_data:
-            logger.warning(f"收到空IMU数据 - Device ID: {device_id}")
-            # 即使没有IMU数据，也保留其他字段并发送到Redis（action设为unknown）
-            result_data = original_data.copy()
-            result_data.pop("imu_data", None)  # 移除imu_data
-            result_data.pop("emotion_sound_osslink", None)  # 移除emotion_sound_osslink
-            result_data["action"] = "unknown"
-            result_data["action_confidence"] = 0.0
-            result_data["inference_timestamp"] = datetime.now().isoformat()
-            
-            # 写入Redis
-            redis_key = f"device_data:{device_id}" if device_id != "unknown" else f"device_data:{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            write_to_redis(redis_key, result_data)
-            return
+            logger.warning(f"收到空IMU数据 - NFC UID: {nfc_uid}")
+            ai_result["action"] = "unknown"
+            ai_result["action_confidence"] = 0.0
+            return ai_result
         
-        logger.info(f"收到Kafka消息 - Device ID: {device_id}, IMU数据点数: {len(imu_data)}")
-        
-        # 1. 将IMU数据转换为虚拟坐标系特征
+        # 2.1 将IMU数据转换为虚拟坐标系特征
         try:
             features_df = convert_imu_to_virtual_features(imu_data)
         except Exception as e:
-            logger.error(f"IMU数据转换失败 - Device ID: {device_id}, Error: {e}")
-            # 转换失败时，仍然保留原始数据并发送到Redis（action设为error）
-            result_data = original_data.copy()
-            result_data.pop("imu_data", None)
-            result_data.pop("emotion_sound_osslink", None)
-            result_data["action"] = "error"
-            result_data["action_confidence"] = 0.0
-            result_data["inference_timestamp"] = datetime.now().isoformat()
-            result_data["inference_error"] = str(e)
-            redis_key = f"device_data:{device_id}" if device_id != "unknown" else f"device_data:{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            write_to_redis(redis_key, result_data)
-            return
+            logger.error(f"IMU数据转换失败 - NFC UID: {nfc_uid}, Error: {e}")
+            ai_result["action"] = "error"
+            ai_result["action_confidence"] = 0.0
+            ai_result["inference_error"] = str(e)
+            return ai_result
         
-        # 2. 保存为临时CSV文件
-        temp_csv_path = TEMP_DIR / f"{device_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.csv"
+        # 2.2 保存为临时CSV文件
+        temp_csv_path = TEMP_DIR / f"{nfc_uid}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.csv"
         try:
             features_df.to_csv(temp_csv_path, index=False)
-            logger.info(f"特征CSV已保存: {temp_csv_path}")
+            logger.debug(f"特征CSV已保存: {temp_csv_path}")
         except Exception as e:
-            logger.error(f"保存CSV文件失败 - Device ID: {device_id}, Error: {e}")
-            # 保存失败时，仍然保留原始数据并发送到Redis
-            result_data = original_data.copy()
-            result_data.pop("imu_data", None)
-            result_data.pop("emotion_sound_osslink", None)
-            result_data["action"] = "error"
-            result_data["action_confidence"] = 0.0
-            result_data["inference_timestamp"] = datetime.now().isoformat()
-            result_data["inference_error"] = f"CSV保存失败: {str(e)}"
-            redis_key = f"device_data:{device_id}" if device_id != "unknown" else f"device_data:{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            write_to_redis(redis_key, result_data)
-            return
+            logger.error(f"保存CSV文件失败 - NFC UID: {nfc_uid}, Error: {e}")
+            ai_result["action"] = "error"
+            ai_result["action_confidence"] = 0.0
+            ai_result["inference_error"] = f"CSV保存失败: {str(e)}"
+            return ai_result
         
-        # 3. 执行推理
+        # 2.3 执行推理
         try:
             inference_result = perform_inference_from_csv(temp_csv_path)
+            ai_result["action"] = inference_result.get("action", "unknown")
+            ai_result["action_confidence"] = inference_result.get("confidence", 0.0)
+            
+            if inference_result.get("status") == "error":
+                ai_result["inference_error"] = inference_result.get("error", "Unknown error")
         except Exception as e:
-            logger.error(f"推理失败 - Device ID: {device_id}, Error: {e}")
+            logger.error(f"推理失败 - NFC UID: {nfc_uid}, Error: {e}")
+            ai_result["action"] = "error"
+            ai_result["action_confidence"] = 0.0
+            ai_result["inference_error"] = str(e)
+        finally:
             # 清理临时文件
-            if temp_csv_path.exists():
-                temp_csv_path.unlink()
-            # 推理失败时，仍然保留原始数据并发送到Redis
-            result_data = original_data.copy()
-            result_data.pop("imu_data", None)
-            result_data.pop("emotion_sound_osslink", None)
-            result_data["action"] = "error"
-            result_data["action_confidence"] = 0.0
-            result_data["inference_timestamp"] = datetime.now().isoformat()
-            result_data["inference_error"] = str(e)
-            redis_key = f"device_data:{device_id}" if device_id != "unknown" else f"device_data:{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            write_to_redis(redis_key, result_data)
-            return
-        
-        # 4. 构建结果数据：保留所有原始字段，移除imu_data和emotion_sound_osslink，添加action字段
-        result_data = original_data.copy()
-        
-        # 移除不需要的字段
-        result_data.pop("imu_data", None)  # 移除原始IMU数据
-        result_data.pop("emotion_sound_osslink", None)  # 移除emotion音频链接（暂时不考虑emotion模型）
-        
-        # 添加推理结果
-        result_data["action"] = inference_result.get("action", "unknown")
-        result_data["action_confidence"] = inference_result.get("confidence", 0.0)
-        result_data["inference_timestamp"] = datetime.now().isoformat()
-        
-        if inference_result.get("status") == "error":
-            result_data["inference_error"] = inference_result.get("error", "Unknown error")
-        
-        # 5. 写入Redis
-        # 使用device_id作为key的一部分，如果没有device_id则使用时间戳
-        redis_key = f"device_data:{device_id}" if device_id != "unknown" else f"device_data:{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        write_to_redis(redis_key, result_data)
-        
-        # 6. 清理临时文件
-        try:
-            if temp_csv_path.exists():
-                temp_csv_path.unlink()
-        except Exception as e:
-            logger.warning(f"清理临时文件失败: {e}")
-        
-        logger.info(f"处理完成 - Device ID: {device_id}, Action: {result_data.get('action')}, Confidence: {result_data.get('action_confidence', 0):.2%}")
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON解析失败: {e}, Message: {message.value}")
-    except Exception as e:
-        logger.error(f"处理Kafka消息失败: {e}", exc_info=True)
-
-# --- 9. Kafka 消费者任务 ---
-async def kafka_consumer_task():
-    """
-    异步Kafka消费者任务
-    """
-    consumer = None
-    try:
-        logger.info(f"启动Kafka消费者 - Topic: {KAFKA_TOPIC}, Servers: {KAFKA_BOOTSTRAP_SERVERS}")
-        
-        consumer = KafkaConsumer(
-            KAFKA_TOPIC,
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(','),
-            group_id=KAFKA_GROUP_ID,
-            auto_offset_reset='latest',  # 从最新消息开始消费
-            enable_auto_commit=True,
-            value_deserializer=lambda m: m.decode('utf-8') if m else None,
-            consumer_timeout_ms=1000  # 1秒超时，用于定期检查
-        )
-        
-        while True:
             try:
-                # 轮询消息
-                message_pack = consumer.poll(timeout_ms=1000)
-                
-                for topic_partition, messages in message_pack.items():
-                    for message in messages:
-                        process_kafka_message(message)
-                
-                # 短暂休眠，避免CPU占用过高
-                await asyncio.sleep(0.1)
-                
-            except KafkaError as e:
-                logger.error(f"Kafka消费错误: {e}")
-                await asyncio.sleep(5)  # 出错后等待5秒再重试
-                
+                if temp_csv_path.exists():
+                    temp_csv_path.unlink()
+            except Exception as e:
+                logger.warning(f"清理临时文件失败: {e}")
+        
+        logger.info(f"处理完成 - NFC UID: {nfc_uid}, Action: {ai_result.get('action')}, Confidence: {ai_result.get('action_confidence', 0):.2%}, Emotion: {ai_result.get('emotion_state')}")
+        return ai_result
+        
     except Exception as e:
-        logger.error(f"Kafka消费者启动失败: {e}")
-    finally:
-        if consumer:
-            consumer.close()
-            logger.info("Kafka消费者已关闭")
+        logger.error(f"处理 Stream 消息失败: {e}", exc_info=True)
+        return {
+            "nfc_uid": message_data.get("nfc_uid", "unknown"),
+            "action": "error",
+            "action_confidence": 0.0,
+            "emotion_state": "error",
+            "emotion_score": 0,
+            "emotion_message": f"处理失败: {str(e)}",
+            "inference_timestamp": datetime.now().isoformat(),
+            "inference_error": str(e)
+        }
 
-# --- 10. 启动后台任务 ---
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时启动Kafka消费者"""
-    asyncio.create_task(kafka_consumer_task())
-    logger.info("AI模型服务已启动，Kafka消费者正在运行...")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """应用关闭时清理资源"""
-    logger.info("正在关闭AI模型服务...")
-    if redis_client is not None:
-        redis_client.close()
-
-# --- 11. 保留HTTP接口用于测试和监控 ---
-@app.post("/predict")
-async def predict(request: dict):
+# --- 11. Redis Stream 消费者主循环 ---
+def redis_stream_consumer_loop():
     """
-    HTTP接口，用于测试和监控
+    Redis Stream 消费者主循环，使用 xreadgroup 阻塞式读取消息
+    具有断线重连机制和消息确认机制
+    """
+    logger.info("启动 Redis Stream 消费者...")
+    logger.info(f"监听 Stream: {REDIS_STREAM_TELEMETRY}")
+    logger.info(f"Consumer Group: {REDIS_STREAM_CONSUMER_GROUP}")
+    logger.info(f"Consumer Name: {REDIS_STREAM_CONSUMER_NAME}")
     
-    接受完整的JSON数据（与Kafka消息格式相同），处理imu_data并返回结果
-    """
-    try:
-        # 提取设备ID和IMU数据
-        device_id = request.get("device_id") or request.get("deviceId") or "unknown"
-        imu_data = request.get("imu_data", [])
-        
-        if not imu_data:
-            raise HTTPException(status_code=400, detail="缺少imu_data字段")
-        
-        # 1. 转换IMU数据
-        features_df = convert_imu_to_virtual_features(imu_data)
-        
-        # 2. 保存为临时CSV
-        temp_csv_path = TEMP_DIR / f"{device_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.csv"
-        features_df.to_csv(temp_csv_path, index=False)
-        
-        # 3. 执行推理
-        inference_result = perform_inference_from_csv(temp_csv_path)
-        
-        # 4. 构建结果：保留所有原始字段，移除imu_data和emotion_sound_osslink，添加action
-        result = request.copy()
-        result.pop("imu_data", None)
-        result.pop("emotion_sound_osslink", None)
-        result["action"] = inference_result.get("action", "unknown")
-        result["action_confidence"] = inference_result.get("confidence", 0.0)
-        result["inference_timestamp"] = datetime.now().isoformat()
-        
-        if inference_result.get("status") == "error":
-            result["inference_error"] = inference_result.get("error", "Unknown error")
-            # 清理临时文件
-            if temp_csv_path.exists():
-                temp_csv_path.unlink()
-            raise HTTPException(status_code=500, detail=result["inference_error"])
-        
-        # 5. 写入Redis
-        redis_key = f"device_data:{device_id}" if device_id != "unknown" else f"device_data:{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        write_to_redis(redis_key, result)
-        
-        # 6. 清理临时文件
-        if temp_csv_path.exists():
-            temp_csv_path.unlink()
-        
-        return result
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"HTTP接口处理失败: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/health")
-async def health_check():
-    """健康检查接口"""
-    redis_connected = False
-    if redis_client is not None:
+    redis_client = None
+    
+    while True:
         try:
-            redis_client.ping()
-            redis_connected = True
-        except:
-            pass
-    
-    return {
-        "status": "healthy",
-        "model_loaded": True,
-        "redis_connected": redis_connected,
-        "device": str(DEVICE)
-    }
-
-@app.get("/redis/{device_id}")
-async def get_redis_result(device_id: str):
-    """从Redis获取指定设备的最新结果"""
-    if redis_client is None:
-        raise HTTPException(status_code=503, detail="Redis未连接")
-    
-    try:
-        redis_key = f"device_data:{device_id}"
-        result_json = redis_client.get(redis_key)
+            # 创建或重新创建 Redis 客户端
+            if redis_client is None:
+                redis_client = create_redis_client()
+                if redis_client is None:
+                    logger.warning(f"Redis 连接失败，{REDIS_RECONNECT_DELAY} 秒后重试...")
+                    time.sleep(REDIS_RECONNECT_DELAY)
+                    continue
+                
+                # 确保 Consumer Group 存在
+                try:
+                    ensure_consumer_group(redis_client, REDIS_STREAM_TELEMETRY, REDIS_STREAM_CONSUMER_GROUP)
+                except Exception as e:
+                    logger.error(f"创建 Consumer Group 失败: {e}，{REDIS_RECONNECT_DELAY} 秒后重试...")
+                    redis_client = None
+                    time.sleep(REDIS_RECONNECT_DELAY)
+                    continue
+            
+            # 使用 xreadgroup 阻塞式读取消息
+            # > 表示只读取未确认的新消息
+            logger.debug(f"等待 Stream 消息: {REDIS_STREAM_TELEMETRY}")
+            messages = redis_client.xreadgroup(
+                groupname=REDIS_STREAM_CONSUMER_GROUP,
+                consumername=REDIS_STREAM_CONSUMER_NAME,
+                streams={REDIS_STREAM_TELEMETRY: ">"},  # > 表示只读取新消息
+                count=1,  # 每次读取1条消息
+                block=0  # 阻塞等待，0表示无限阻塞
+            )
+            
+            if not messages:
+                # 没有消息，继续循环
+                continue
+            
+            # xreadgroup 返回格式: [(stream_name, [(message_id, {field: value, ...}), ...]), ...]
+            for stream_name, stream_messages in messages:
+                for message_id, message_data in stream_messages:
+                    logger.info(f"收到 Stream 消息 - Stream: {stream_name}, Message ID: {message_id}")
+                    
+                    # 解析消息数据（根据 REDIS_DECODE 配置，可能是 bytes 或字符串）
+                    parsed_data = {}
+                    for key, value in message_data.items():
+                        if isinstance(key, bytes):
+                            key = key.decode('utf-8')
+                        if isinstance(value, bytes):
+                            value = value.decode('utf-8')
+                        parsed_data[key] = value
+                    
+                    # 处理消息
+                    try:
+                        ai_result = process_stream_message(parsed_data)
+                        nfc_uid = ai_result.get("nfc_uid", "unknown")
+                        
+                        # 更新 Redis Hash（主要数据存储）
+                        update_success = update_redis_hash_latest(redis_client, nfc_uid, ai_result)
+                        
+                        # 发布到 Pub/Sub（通知机制）
+                        publish_success = publish_ai_result(redis_client, nfc_uid, ai_result)
+                        
+                        # 确认消息（XACK）- 只要 Hash 更新成功就确认（Pub/Sub 失败不影响）
+                        if update_success:
+                            redis_client.xack(
+                                REDIS_STREAM_TELEMETRY,
+                                REDIS_STREAM_CONSUMER_GROUP,
+                                message_id
+                            )
+                            logger.info(f"消息已确认 - Message ID: {message_id}, NFC UID: {nfc_uid}, Hash更新: {update_success}, Pub/Sub: {publish_success}")
+                        else:
+                            logger.warning(f"Hash 更新失败，消息未确认 - Message ID: {message_id}, NFC UID: {nfc_uid}")
+                            if not publish_success:
+                                logger.warning(f"Pub/Sub 发布也失败 - NFC UID: {nfc_uid}")
+                            
+                    except Exception as e:
+                        logger.error(f"处理 Stream 消息时发生异常: {e}", exc_info=True)
+                        # 处理失败时不确认消息，让消息保留在 Pending 列表中
+                        # 可以根据需要实现重试机制或死信队列
+                        nfc_uid = parsed_data.get("nfc_uid", "unknown")
+                        logger.error(f"消息处理失败，未确认 - Message ID: {message_id}, NFC UID: {nfc_uid}, Error: {e}")
         
-        if result_json:
-            return json.loads(result_json)
-        else:
-            raise HTTPException(status_code=404, detail=f"未找到设备 {device_id} 的结果")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取Redis数据失败: {str(e)}")
+        except redis.ConnectionError as e:
+            logger.error(f"Redis 连接错误: {e}，尝试重连...")
+            redis_client = None
+            time.sleep(REDIS_RECONNECT_DELAY)
+        
+        except redis.TimeoutError as e:
+            logger.error(f"Redis 超时错误: {e}，尝试重连...")
+            redis_client = None
+            time.sleep(REDIS_RECONNECT_DELAY)
+        
+        except Exception as e:
+            logger.error(f"Redis Stream 消费者发生未知错误: {e}", exc_info=True)
+            redis_client = None
+            time.sleep(REDIS_RECONNECT_DELAY)
 
+# --- 12. 主程序入口 ---
 if __name__ == "__main__":
-    import uvicorn
-    logger.info("启动FastAPI服务...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    logger.info("=" * 60)
+    logger.info("AI 模型服务 - Redis Stream 消费者模式")
+    logger.info("=" * 60)
+    logger.info(f"环境: {ENV}")
+    logger.info(f"模型设备: {DEVICE}")
+    logger.info(f"已加载模型数量: {len(models)}")
+    logger.info(f"Redis 服务器: {REDIS_HOST}:{REDIS_PORT}")
+    logger.info(f"Redis Stream: {REDIS_STREAM_TELEMETRY}")
+    logger.info(f"Consumer Group: {REDIS_STREAM_CONSUMER_GROUP}")
+    logger.info(f"Consumer Name: {REDIS_STREAM_CONSUMER_NAME}")
+    logger.info(f"Redis Key 前缀: {REDIS_KEY_PREFIX}")
+    logger.info("=" * 60)
+    
+    # 启动 Stream 消费者循环
+    try:
+        redis_stream_consumer_loop()
+    except KeyboardInterrupt:
+        logger.info("收到中断信号，正在关闭服务...")
+    except Exception as e:
+        logger.error(f"服务异常退出: {e}", exc_info=True)
+    finally:
+        logger.info("AI 模型服务已关闭")
