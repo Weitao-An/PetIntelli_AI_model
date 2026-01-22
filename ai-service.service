@@ -9,7 +9,7 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/opt/ai_service
-Environment="ENV=prod"
+Environment="ENV=dev"
 Environment="REDIS_HOST=47.97.19.58"
 Environment="REDIS_PORT=6379"
 Environment="REDIS_DB=0"

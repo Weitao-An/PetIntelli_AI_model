@@ -17,7 +17,7 @@ if [ -f ".env" ]; then
 fi
 
 # 设置默认环境变量
-export ENV=${ENV:-prod}
+export ENV=${ENV:-dev}
 export REDIS_HOST=${REDIS_HOST:-47.97.19.58}
 export REDIS_PORT=${REDIS_PORT:-6379}
 export REDIS_DB=${REDIS_DB:-0}

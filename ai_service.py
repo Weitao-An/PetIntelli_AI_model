@@ -56,7 +56,11 @@ REDIS_RECONNECT_DELAY = int(os.getenv("REDIS_RECONNECT_DELAY", 5))  # 重连延�
 REDIS_KEY_PREFIX = f"pi:{ENV}"
 
 # Redis Stream 配置
-REDIS_STREAM_TELEMETRY = f"pi:{ENV}:stream:telemetry_ai"  # AI遥测数据流（根据环境变量动态配置）
+# 可以通过环境变量 REDIS_STREAM_TELEMETRY 自定义，否则使用默认格式
+REDIS_STREAM_TELEMETRY = os.getenv(
+    "REDIS_STREAM_TELEMETRY", 
+    f"pi:{ENV}:stream:telemetry_ai"  # 默认格式：pi:{env}:stream:telemetry_ai
+)  # AI遥测数据流
 REDIS_STREAM_CONSUMER_GROUP = "ai_service"  # 消费者组名称
 REDIS_STREAM_CONSUMER_NAME = f"ai_worker_{os.getpid()}"  # 消费者名称（使用进程ID）
 
@@ -204,12 +208,17 @@ except Exception as e:
     exit(1)
 
 # --- 4. IMU数据转换函数 ---
-def convert_imu_to_virtual_features(imu_data: List[Dict]) -> pd.DataFrame:
+def convert_imu_to_virtual_features(imu_data: List[Dict], base_timestamp_ms: int = 0) -> pd.DataFrame:
     """
     将原始IMU数据转换为虚拟坐标系特征
     
+    支持两种格式：
+    1. 新格式（EMQX）：samples 包含 ax, ay, az, gx, gy, gz, dt_ms（相对时间）
+    2. 旧格式：包含 acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z, timestamp（绝对时间）
+    
     Args:
-        imu_data: IMU数据列表，每个元素包含 sequence, timestamp, acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z
+        imu_data: IMU数据列表
+        base_timestamp_ms: 基准时间戳（毫秒），用于将 dt_ms 转换为绝对时间戳
         
     Returns:
         包含虚拟坐标系特征的DataFrame
@@ -220,22 +229,62 @@ def convert_imu_to_virtual_features(imu_data: List[Dict]) -> pd.DataFrame:
     # 转换为DataFrame
     df = pd.DataFrame(imu_data)
     
-    # 确保必要的列存在
-    required_cols = ['timestamp', 'acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z']
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"缺少必要的列: {missing_cols}")
+    # 检查是新格式还是旧格式
+    has_new_format = 'ax' in df.columns and 'dt_ms' in df.columns
+    has_old_format = 'acc_x' in df.columns and 'timestamp' in df.columns
     
-    # 转换为数值类型
-    for col in required_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+    if has_new_format:
+        # 新格式：ax, ay, az, gx, gy, gz, dt_ms
+        # 需要转换为旧格式的字段名，并计算绝对时间戳
+        required_cols = ['ax', 'ay', 'az', 'gx', 'gy', 'gz', 'dt_ms']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"缺少必要的列（新格式）: {missing_cols}")
+        
+        # 转换为数值类型
+        for col in required_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # 将 dt_ms 转换为绝对时间戳（秒）
+        # dt_ms 是相对时间，需要累积计算
+        dt_ms_values = df['dt_ms'].fillna(40).values  # 默认40ms
+        timestamps = []
+        current_time_ms = base_timestamp_ms
+        for dt_ms in dt_ms_values:
+            timestamps.append(current_time_ms / 1000.0)  # 转换为秒
+            current_time_ms += dt_ms
+        
+        df['timestamp'] = timestamps
+        
+        # 重命名字段以匹配旧格式
+        # 注意：保持原始单位，不做转换（模型训练时使用的单位可能就是这个）
+        # 如果后续发现需要单位转换，可以在这里调整
+        df['acc_x'] = df['ax'].values  # 直接使用原始值
+        df['acc_y'] = df['ay'].values
+        df['acc_z'] = df['az'].values
+        df['gyro_x'] = df['gx'].values  # 直接使用原始值
+        df['gyro_y'] = df['gy'].values
+        df['gyro_z'] = df['gz'].values
+        
+    elif has_old_format:
+        # 旧格式：acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z, timestamp
+        required_cols = ['timestamp', 'acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"缺少必要的列（旧格式）: {missing_cols}")
+        
+        # 转换为数值类型
+        for col in required_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    else:
+        raise ValueError("无法识别IMU数据格式，需要包含 (ax,ay,az,gx,gy,gz,dt_ms) 或 (acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,timestamp)")
     
     # 按timestamp排序
     df = df.sort_values('timestamp').reset_index(drop=True)
     
-    # 计算时间间隔（用于导数计算）
-    dt = df['timestamp'].diff().fillna(df['timestamp'].iloc[0] if len(df) > 0 else 0.04)
-    dt = dt.replace(0, 0.04)  # 默认50Hz采样率
+    # 计算时间间隔（用于导数计算，单位：秒）
+    dt = df['timestamp'].diff().fillna(0.04)  # 默认40ms = 0.04秒
+    dt = dt.replace(0, 0.04)  # 避免除零
     dt_values = dt.values  # 转换为numpy数组以便后续使用
     
     # 计算pitch和roll（从加速度计）
@@ -628,12 +677,12 @@ def process_stream_message(message_data: dict) -> dict:
     """
     处理从 Redis Stream 获取的消息数据
     
-    消息格式：
+    消息格式（EMQX 直接发送的格式）：
     - nfc_uid: 设备ID
-    - event_type: "telemetry_ai"
-    - timestamp: 时间戳
-    - data: JSON 字符串，包含 items 数组
-      - items 中 type="imu" 的项包含 samples
+    - dev_ts_ms: 设备时间戳（毫秒）
+    - battery: 电池电量
+    - items: 数组，包含不同类型的数据项
+      - items 中 type="imu" 的项包含 samples（字段：ax, ay, az, gx, gy, gz, dt_ms）
       - items 中 type="audio_meta" 的项包含 sound_osslink
     
     Args:
@@ -645,29 +694,46 @@ def process_stream_message(message_data: dict) -> dict:
     try:
         # 解析消息顶层字段
         nfc_uid = message_data.get("nfc_uid", "unknown")
-        event_type = message_data.get("event_type", "")
-        data_str = message_data.get("data", "{}")
+        dev_ts_ms = message_data.get("dev_ts_ms", 0)
         
-        logger.info(f"开始处理 Stream 消息 - NFC UID: {nfc_uid}, Event Type: {event_type}")
+        logger.info(f"开始处理 Stream 消息 - NFC UID: {nfc_uid}, Dev TS: {dev_ts_ms}")
         
-        # 解析 data 字段（JSON 字符串）
-        try:
-            data = json.loads(data_str) if isinstance(data_str, str) else data_str
-        except json.JSONDecodeError as e:
-            logger.error(f"data 字段 JSON 解析失败 - NFC UID: {nfc_uid}, Error: {e}")
-            return {
-                "nfc_uid": nfc_uid,
-                "action": "error",
-                "action_confidence": 0.0,
-                "emotion_state": "error",
-                "emotion_score": 0,
-                "emotion_message": f"数据解析失败: {str(e)}",
-                "inference_timestamp": datetime.now().isoformat(),
-                "inference_error": f"JSON解析失败: {str(e)}"
-            }
+        # 如果 message_data 是字符串，先解析 JSON
+        if isinstance(message_data, str):
+            try:
+                message_data = json.loads(message_data)
+            except json.JSONDecodeError as e:
+                logger.error(f"消息 JSON 解析失败 - NFC UID: {nfc_uid}, Error: {e}")
+                return {
+                    "nfc_uid": nfc_uid,
+                    "action": "error",
+                    "action_confidence": 0.0,
+                    "emotion_state": "error",
+                    "emotion_score": 0,
+                    "emotion_message": f"数据解析失败: {str(e)}",
+                    "inference_timestamp": datetime.now().isoformat(),
+                    "inference_error": f"JSON解析失败: {str(e)}"
+                }
         
-        # 从 data.items 中提取 IMU 和 audio_meta
-        items = data.get("items", [])
+        # 如果 message_data 是字典但只有一个字段（可能是 "payload" 或 "data"），尝试解析该字段
+        if isinstance(message_data, dict) and len(message_data) == 1:
+            single_key = list(message_data.keys())[0]
+            single_value = message_data[single_key]
+            if isinstance(single_value, str):
+                try:
+                    parsed_json = json.loads(single_value)
+                    if isinstance(parsed_json, dict):
+                        message_data = parsed_json
+                        logger.debug(f"从字段 {single_key} 解析 JSON 消息")
+                except (json.JSONDecodeError, TypeError):
+                    pass  # 不是 JSON，使用原始数据
+        
+        # 更新 nfc_uid 和 dev_ts_ms（可能在解析后更新）
+        nfc_uid = message_data.get("nfc_uid", nfc_uid)
+        dev_ts_ms = message_data.get("dev_ts_ms", dev_ts_ms)
+        
+        # 从顶层获取 items 数组（新格式直接在顶层有 items）
+        items = message_data.get("items", [])
         imu_item = None
         audio_meta_item = None
         
@@ -711,6 +777,7 @@ def process_stream_message(message_data: dict) -> dict:
         # 提取 IMU samples
         imu_v = imu_item.get("v", {})
         imu_samples = imu_v.get("samples", [])
+        imu_timestamp = imu_v.get("timestamp", dev_ts_ms)  # 使用 IMU 项的 timestamp 或设备时间戳
         
         if not imu_samples:
             logger.warning(f"IMU samples 为空 - NFC UID: {nfc_uid}")
@@ -722,7 +789,8 @@ def process_stream_message(message_data: dict) -> dict:
         
         # 2.1 将IMU数据转换为虚拟坐标系特征
         try:
-            features_df = convert_imu_to_virtual_features(imu_samples)
+            # 传递基准时间戳（毫秒）用于新格式的时间戳计算
+            features_df = convert_imu_to_virtual_features(imu_samples, base_timestamp_ms=imu_timestamp)
         except Exception as e:
             logger.error(f"IMU数据转换失败 - NFC UID: {nfc_uid}, Error: {e}")
             ai_result["action"] = "error"
@@ -847,7 +915,21 @@ def redis_stream_consumer_loop():
                         parsed_data[key] = value
                     
                     # 处理消息
+                    # 如果消息只有一个字段（通常是 "payload" 或 "data"），尝试解析为 JSON
                     try:
+                        # 检查是否是单个 JSON 字符串字段
+                        if len(parsed_data) == 1:
+                            single_key = list(parsed_data.keys())[0]
+                            single_value = parsed_data[single_key]
+                            # 尝试解析为 JSON
+                            try:
+                                parsed_json = json.loads(single_value) if isinstance(single_value, str) else single_value
+                                if isinstance(parsed_json, dict):
+                                    parsed_data = parsed_json
+                                    logger.debug(f"从单个字段解析 JSON 消息: {single_key}")
+                            except (json.JSONDecodeError, TypeError):
+                                pass  # 不是 JSON，使用原始数据
+                        
                         ai_result = process_stream_message(parsed_data)
                         nfc_uid = ai_result.get("nfc_uid", "unknown")
                         
