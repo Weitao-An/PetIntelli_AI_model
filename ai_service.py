@@ -56,7 +56,7 @@ REDIS_RECONNECT_DELAY = int(os.getenv("REDIS_RECONNECT_DELAY", 5))  # 重连延�
 REDIS_KEY_PREFIX = f"pi:{ENV}"
 
 # Redis Stream 配置
-REDIS_STREAM_TELEMETRY = "pi:dev:stream:telemetry"  # 遥测数据流（固定为 dev 环境）
+REDIS_STREAM_TELEMETRY = f"pi:{ENV}:stream:telemetry_ai"  # AI遥测数据流（根据环境变量动态配置）
 REDIS_STREAM_CONSUMER_GROUP = "ai_service"  # 消费者组名称
 REDIS_STREAM_CONSUMER_NAME = f"ai_worker_{os.getpid()}"  # 消费者名称（使用进程ID）
 
@@ -474,25 +474,31 @@ def create_redis_client():
 def ensure_consumer_group(client: redis.Redis, stream_name: str, group_name: str):
     """
     确保 Consumer Group 存在，如果不存在则创建
+    新创建的 Consumer Group 将从最新消息开始读取（使用 $）
     
     Args:
         client: Redis 客户端
         stream_name: Stream 名称
         group_name: Consumer Group 名称
+        
+    Returns:
+        bool: 是否新创建了 Consumer Group（True=新创建，False=已存在）
     """
     try:
-        # 尝试创建 Consumer Group（从 0 开始读取）
+        # 尝试创建 Consumer Group（从最新消息开始，使用 $）
         client.xgroup_create(
             name=stream_name,
             groupname=group_name,
-            id="0",  # 从 Stream 开始读取
+            id="$",  # $ 表示从最新消息开始读取（只读取创建后的新消息）
             mkstream=True  # 如果 Stream 不存在则创建
         )
-        logger.info(f"创建 Consumer Group: {group_name} for Stream: {stream_name}")
+        logger.info(f"创建 Consumer Group: {group_name} for Stream: {stream_name} (从最新消息开始)")
+        return True  # 新创建
     except redis.ResponseError as e:
         if "BUSYGROUP" in str(e):
             # Consumer Group 已存在，这是正常的
-            logger.debug(f"Consumer Group 已存在: {group_name}")
+            logger.debug(f"Consumer Group 已存在: {group_name}，将只读取新消息")
+            return False  # 已存在
         else:
             logger.error(f"创建 Consumer Group 失败: {e}")
             raise
@@ -798,7 +804,13 @@ def redis_stream_consumer_loop():
                 
                 # 确保 Consumer Group 存在
                 try:
-                    ensure_consumer_group(redis_client, REDIS_STREAM_TELEMETRY, REDIS_STREAM_CONSUMER_GROUP)
+                    group_created = ensure_consumer_group(redis_client, REDIS_STREAM_TELEMETRY, REDIS_STREAM_CONSUMER_GROUP)
+                    
+                    # 如果 Consumer Group 是新创建的，使用 $ 已经定位到最新位置
+                    # 后续使用 > 将只读取创建后的新消息
+                    if group_created:
+                        logger.info("Consumer Group 为新创建，已定位到最新消息位置，将只读取新消息")
+                    
                 except Exception as e:
                     logger.error(f"创建 Consumer Group 失败: {e}，{REDIS_RECONNECT_DELAY} 秒后重试...")
                     redis_client = None
@@ -806,7 +818,7 @@ def redis_stream_consumer_loop():
                     continue
             
             # 使用 xreadgroup 阻塞式读取消息
-            # > 表示只读取未确认的新消息
+            # > 表示只读取未确认的新消息（创建 Consumer Group 后的新消息）
             logger.debug(f"等待 Stream 消息: {REDIS_STREAM_TELEMETRY}")
             messages = redis_client.xreadgroup(
                 groupname=REDIS_STREAM_CONSUMER_GROUP,
