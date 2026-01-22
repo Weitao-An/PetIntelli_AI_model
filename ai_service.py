@@ -56,7 +56,7 @@ REDIS_RECONNECT_DELAY = int(os.getenv("REDIS_RECONNECT_DELAY", 5))  # 重连延�
 REDIS_KEY_PREFIX = f"pi:{ENV}"
 
 # Redis Stream 配置
-REDIS_STREAM_TELEMETRY = f"{REDIS_KEY_PREFIX}:stream:telemetry"  # 遥测数据流
+REDIS_STREAM_TELEMETRY = "pi:dev:stream:telemetry"  # 遥测数据流（固定为 dev 环境）
 REDIS_STREAM_CONSUMER_GROUP = "ai_service"  # 消费者组名称
 REDIS_STREAM_CONSUMER_NAME = f"ai_worker_{os.getpid()}"  # 消费者名称（使用进程ID）
 
@@ -404,23 +404,45 @@ def perform_inference_from_csv(csv_path: Path) -> Dict[str, Any]:
             "error": error_msg
         }
 
-# --- 6. Emotion 处理函数（暂时 Mock）---
-def process_emotion(emotion_sound_osslink: str) -> dict:
+# --- 6. Emotion 处理函数 ---
+def process_emotion(sound_osslink: str) -> dict:
     """
-    处理 emotion 数据（暂时使用 Mock 返回）
+    处理 emotion 数据（通过 sound_osslink 下载和处理音频）
     
     Args:
-        emotion_sound_osslink: 音频链接
+        sound_osslink: 音频 OSS 链接路径，例如 "audio/DEVICE_001/2024/12/24/clip_12345.opus"
         
     Returns:
         包含 emotion 结果的字典
     """
-    # TODO: 后续接入真实的 emotion 模块
-    logger.debug(f"处理 emotion - OSS Link: {emotion_sound_osslink}")
-    return {
-        "emotion": "calm",
-        "score": 80
-    }
+    try:
+        if not sound_osslink:
+            logger.warning("sound_osslink 为空，使用默认 emotion 值")
+            return {
+                "emotion": "unknown",
+                "score": 0
+            }
+        
+        logger.info(f"处理 emotion - OSS Link: {sound_osslink}")
+        
+        # TODO: 实现音频下载和处理逻辑
+        # 1. 从 OSS 下载音频文件
+        # 2. 调用 emotion 模型处理音频
+        # 3. 返回 emotion 结果
+        
+        # 暂时使用 Mock 返回
+        logger.debug(f"Emotion 处理（Mock）- OSS Link: {sound_osslink}")
+        return {
+            "emotion": "calm",
+            "score": 80
+        }
+        
+    except Exception as e:
+        logger.error(f"Emotion 处理失败 - OSS Link: {sound_osslink}, Error: {e}")
+        return {
+            "emotion": "error",
+            "score": 0
+        }
 
 # --- 7. Redis 客户端管理 ---
 def create_redis_client():
@@ -475,10 +497,45 @@ def ensure_consumer_group(client: redis.Redis, stream_name: str, group_name: str
             logger.error(f"创建 Consumer Group 失败: {e}")
             raise
 
-# --- 8. 将结果写入 Redis Hash ---
+# --- 8. 更新 Redis Hash 单个字段 ---
+def update_latest_field(client: redis.Redis, nfc_uid: str, field: str, value: str):
+    """
+    更新 Redis Hash Key pi:dev:dev:{nfc_uid}:latest 的单个字段
+    
+    Args:
+        client: Redis 客户端
+        nfc_uid: NFC UID
+        field: 字段名
+        value: 字段值
+        
+    Returns:
+        是否成功
+    """
+    if client is None:
+        logger.warning(f"Redis未连接，跳过更新字段 - NFC UID: {nfc_uid}, Field: {field}")
+        return False
+    
+    try:
+        # 构建 Redis Hash Key: pi:dev:dev:{nfc_uid}:latest
+        redis_key = f"pi:dev:dev:{nfc_uid}:latest"
+        
+        # 更新单个字段
+        client.hset(redis_key, field, str(value))
+        
+        # 设置过期时间（24小时）
+        client.expire(redis_key, 24 * 60 * 60)
+        
+        logger.debug(f"更新 Redis Hash 字段 - Key: {redis_key}, Field: {field}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"更新 Redis Hash 字段失败 - NFC UID: {nfc_uid}, Field: {field}, Error: {e}")
+        return False
+
+# --- 8.1 批量更新 Redis Hash 字段 ---
 def update_redis_hash_latest(client: redis.Redis, nfc_uid: str, ai_result: dict):
     """
-    更新 Redis Hash Key pi:{env}:dev:{nfc_uid}:latest
+    批量更新 Redis Hash Key pi:dev:dev:{nfc_uid}:latest 的多个字段
     
     Args:
         client: Redis 客户端
@@ -493,8 +550,8 @@ def update_redis_hash_latest(client: redis.Redis, nfc_uid: str, ai_result: dict)
         return False
     
     try:
-        # 构建 Redis Hash Key: pi:{env}:dev:{nfc_uid}:latest
-        redis_key = REDIS_KEY_DEV_LATEST.format(nfc_uid=nfc_uid)
+        # 构建 Redis Hash Key: pi:dev:dev:{nfc_uid}:latest
+        redis_key = f"pi:dev:dev:{nfc_uid}:latest"
         
         # 将 AI 结果字段写入 Hash
         # 只更新 AI 相关的字段，保留其他字段
@@ -565,30 +622,55 @@ def process_stream_message(message_data: dict) -> dict:
     """
     处理从 Redis Stream 获取的消息数据
     
+    消息格式：
+    - nfc_uid: 设备ID
+    - event_type: "telemetry_ai"
+    - timestamp: 时间戳
+    - data: JSON 字符串，包含 items 数组
+      - items 中 type="imu" 的项包含 samples
+      - items 中 type="audio_meta" 的项包含 sound_osslink
+    
     Args:
-        message_data: Stream 消息数据字典（包含 nfc_uid, imu_data 等字段）
+        message_data: Stream 消息数据字典
         
     Returns:
         AI 处理结果字典（包含 emotion_state, emotion_score, action 等字段）
     """
     try:
-        # 解析消息中的字段
+        # 解析消息顶层字段
         nfc_uid = message_data.get("nfc_uid", "unknown")
-        imu_data_raw = message_data.get("imu_data", [])
-        emotion_sound_osslink = message_data.get("emotion_sound_osslink", "")
+        event_type = message_data.get("event_type", "")
+        data_str = message_data.get("data", "{}")
         
-        logger.info(f"开始处理 Stream 消息 - NFC UID: {nfc_uid}, IMU数据点数: {len(imu_data_raw) if isinstance(imu_data_raw, list) else 0}")
+        logger.info(f"开始处理 Stream 消息 - NFC UID: {nfc_uid}, Event Type: {event_type}")
         
-        # 解析 imu_data（可能是 JSON 字符串）
-        imu_data = []
-        if isinstance(imu_data_raw, str):
-            try:
-                imu_data = json.loads(imu_data_raw)
-            except json.JSONDecodeError:
-                logger.error(f"IMU数据JSON解析失败 - NFC UID: {nfc_uid}")
-                imu_data = []
-        elif isinstance(imu_data_raw, list):
-            imu_data = imu_data_raw
+        # 解析 data 字段（JSON 字符串）
+        try:
+            data = json.loads(data_str) if isinstance(data_str, str) else data_str
+        except json.JSONDecodeError as e:
+            logger.error(f"data 字段 JSON 解析失败 - NFC UID: {nfc_uid}, Error: {e}")
+            return {
+                "nfc_uid": nfc_uid,
+                "action": "error",
+                "action_confidence": 0.0,
+                "emotion_state": "error",
+                "emotion_score": 0,
+                "emotion_message": f"数据解析失败: {str(e)}",
+                "inference_timestamp": datetime.now().isoformat(),
+                "inference_error": f"JSON解析失败: {str(e)}"
+            }
+        
+        # 从 data.items 中提取 IMU 和 audio_meta
+        items = data.get("items", [])
+        imu_item = None
+        audio_meta_item = None
+        
+        for item in items:
+            item_type = item.get("type", "")
+            if item_type == "imu":
+                imu_item = item
+            elif item_type == "audio_meta":
+                audio_meta_item = item
         
         # 初始化结果字典
         ai_result = {
@@ -596,9 +678,14 @@ def process_stream_message(message_data: dict) -> dict:
             "inference_timestamp": datetime.now().isoformat()
         }
         
-        # 1. 处理 Emotion（暂时使用 Mock）
+        # 1. 处理 Emotion（从 audio_meta 中提取 sound_osslink）
+        sound_osslink = ""
+        if audio_meta_item:
+            audio_v = audio_meta_item.get("v", {})
+            sound_osslink = audio_v.get("sound_osslink", "")
+        
         try:
-            emotion_result = process_emotion(emotion_sound_osslink)
+            emotion_result = process_emotion(sound_osslink)
             ai_result["emotion_state"] = emotion_result.get("emotion", "calm")
             ai_result["emotion_score"] = emotion_result.get("score", 80)
             ai_result["emotion_message"] = f"宠物状态{emotion_result.get('emotion', 'calm')}，情绪评分{emotion_result.get('score', 80)}。"
@@ -609,15 +696,27 @@ def process_stream_message(message_data: dict) -> dict:
             ai_result["emotion_message"] = f"Emotion 处理失败: {str(e)}"
         
         # 2. 处理 IMU 数据（Action 推理）
-        if not imu_data:
-            logger.warning(f"收到空IMU数据 - NFC UID: {nfc_uid}")
+        if not imu_item:
+            logger.warning(f"未找到 IMU 数据 - NFC UID: {nfc_uid}")
             ai_result["action"] = "unknown"
             ai_result["action_confidence"] = 0.0
             return ai_result
         
+        # 提取 IMU samples
+        imu_v = imu_item.get("v", {})
+        imu_samples = imu_v.get("samples", [])
+        
+        if not imu_samples:
+            logger.warning(f"IMU samples 为空 - NFC UID: {nfc_uid}")
+            ai_result["action"] = "unknown"
+            ai_result["action_confidence"] = 0.0
+            return ai_result
+        
+        logger.info(f"提取到 IMU 数据 - NFC UID: {nfc_uid}, Samples 数量: {len(imu_samples)}")
+        
         # 2.1 将IMU数据转换为虚拟坐标系特征
         try:
-            features_df = convert_imu_to_virtual_features(imu_data)
+            features_df = convert_imu_to_virtual_features(imu_samples)
         except Exception as e:
             logger.error(f"IMU数据转换失败 - NFC UID: {nfc_uid}, Error: {e}")
             ai_result["action"] = "error"
@@ -740,22 +839,40 @@ def redis_stream_consumer_loop():
                         ai_result = process_stream_message(parsed_data)
                         nfc_uid = ai_result.get("nfc_uid", "unknown")
                         
-                        # 更新 Redis Hash（主要数据存储）
-                        update_success = update_redis_hash_latest(redis_client, nfc_uid, ai_result)
+                        # 使用 update_latest_field 逐个更新 Redis Hash 字段
+                        update_success = True
+                        if "emotion_state" in ai_result:
+                            if not update_latest_field(redis_client, nfc_uid, "emotion_state", ai_result["emotion_state"]):
+                                update_success = False
+                        if "emotion_score" in ai_result:
+                            if not update_latest_field(redis_client, nfc_uid, "emotion_score", str(ai_result["emotion_score"])):
+                                update_success = False
+                        if "emotion_message" in ai_result:
+                            if not update_latest_field(redis_client, nfc_uid, "emotion_message", ai_result["emotion_message"]):
+                                update_success = False
+                        if "action" in ai_result:
+                            if not update_latest_field(redis_client, nfc_uid, "action", ai_result["action"]):
+                                update_success = False
+                        if "action_confidence" in ai_result:
+                            if not update_latest_field(redis_client, nfc_uid, "action_confidence", str(ai_result["action_confidence"])):
+                                update_success = False
+                        if "inference_timestamp" in ai_result:
+                            if not update_latest_field(redis_client, nfc_uid, "inference_timestamp", ai_result["inference_timestamp"]):
+                                update_success = False
                         
                         # 发布到 Pub/Sub（通知机制）
                         publish_success = publish_ai_result(redis_client, nfc_uid, ai_result)
                         
-                        # 确认消息（XACK）- 只要 Hash 更新成功就确认（Pub/Sub 失败不影响）
+                        # 确认消息（XACK）- 只要字段更新成功就确认（Pub/Sub 失败不影响）
                         if update_success:
                             redis_client.xack(
                                 REDIS_STREAM_TELEMETRY,
                                 REDIS_STREAM_CONSUMER_GROUP,
                                 message_id
                             )
-                            logger.info(f"消息已确认 - Message ID: {message_id}, NFC UID: {nfc_uid}, Hash更新: {update_success}, Pub/Sub: {publish_success}")
+                            logger.info(f"消息已确认 - Message ID: {message_id}, NFC UID: {nfc_uid}, 字段更新: {update_success}, Pub/Sub: {publish_success}")
                         else:
-                            logger.warning(f"Hash 更新失败，消息未确认 - Message ID: {message_id}, NFC UID: {nfc_uid}")
+                            logger.warning(f"字段更新失败，消息未确认 - Message ID: {message_id}, NFC UID: {nfc_uid}")
                             if not publish_success:
                                 logger.warning(f"Pub/Sub 发布也失败 - NFC UID: {nfc_uid}")
                             
