@@ -643,10 +643,18 @@ def publish_ai_result(client: redis.Redis, nfc_uid: str, ai_result: dict):
     """
     通过 Pub/Sub 频道发布 AI 结果
     
+    消息格式符合 WebSocket 期望：
+    {
+        "type": "latest_field",  # WebSocket 需要此字段来触发推送
+        "nfc_uid": nfc_uid,
+        "data": {},  # WebSocket 会重新从 Redis 读取，这里可以为空
+        "timestamp": timestamp_ms
+    }
+    
     Args:
         client: Redis 客户端
         nfc_uid: NFC UID
-        ai_result: AI 处理结果字典
+        ai_result: AI 处理结果字典（用于日志记录）
         
     Returns:
         是否成功
@@ -659,13 +667,22 @@ def publish_ai_result(client: redis.Redis, nfc_uid: str, ai_result: dict):
         # 构建 Pub/Sub 频道: pi:{env}:pub:{nfc_uid}
         channel = REDIS_PUB_CHANNEL.format(nfc_uid=nfc_uid)
         
-        # 将结果序列化为JSON字符串
-        message_json = json.dumps(ai_result, ensure_ascii=False)
+        # 构建符合 WebSocket 期望的消息格式
+        # WebSocket 会检查 type 字段，如果是 "latest" 或 "latest_field"，会重新从 Redis 读取数据
+        message = {
+            "type": "latest_field",  # 关键字段：WebSocket 需要此字段来触发推送
+            "nfc_uid": nfc_uid,
+            "data": {},  # WebSocket 会重新从 Redis Hash 读取最新数据，这里可以为空
+            "timestamp": int(datetime.now().timestamp() * 1000)
+        }
+        
+        # 将消息序列化为JSON字符串
+        message_json = json.dumps(message, ensure_ascii=False)
         
         # 发布消息
         client.publish(channel, message_json)
         
-        logger.info(f"发布 AI 结果到 Pub/Sub - Channel: {channel}")
+        logger.info(f"发布 AI 结果到 Pub/Sub - Channel: {channel}, Type: latest_field")
         return True
         
     except Exception as e:
@@ -732,8 +749,29 @@ def process_stream_message(message_data: dict) -> dict:
         nfc_uid = message_data.get("nfc_uid", nfc_uid)
         dev_ts_ms = message_data.get("dev_ts_ms", dev_ts_ms)
         
-        # 从顶层获取 items 数组（新格式直接在顶层有 items）
-        items = message_data.get("items", [])
+        # 检查是否有 data 字段（JSON 字符串格式）
+        # 根据之前的日志，items 数组在 data 字段里面
+        data_str = message_data.get("data", None)
+        if data_str:
+            # data 字段存在，需要解析它
+            try:
+                if isinstance(data_str, str):
+                    data = json.loads(data_str)
+                else:
+                    data = data_str
+                
+                # 从解析后的 data 中获取 items 和 dev_ts_ms
+                items = data.get("items", [])
+                # 更新 dev_ts_ms（优先使用 data 中的值）
+                dev_ts_ms = data.get("dev_ts_ms", dev_ts_ms)
+                logger.info(f"从 data 字段解析到 Items 数量: {len(items)}")
+            except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                logger.error(f"解析 data 字段失败 - NFC UID: {nfc_uid}, Error: {e}")
+                items = []
+        else:
+            # 没有 data 字段，直接从顶层获取 items（兼容旧格式）
+            items = message_data.get("items", [])
+            logger.info(f"从顶层获取 Items 数量: {len(items)}")
         imu_item = None
         audio_meta_item = None
         
