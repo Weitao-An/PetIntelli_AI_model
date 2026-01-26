@@ -6,6 +6,23 @@ import pandas as pd
 import pickle
 from pathlib import Path
 import warnings
+import sys
+import os
+
+# 添加ai_service模块路径
+sys.path.insert(0, str(Path(__file__).parent))
+
+# 从ai_service导入必要的函数
+from ai_service import (
+    convert_csv_to_virtual_features,
+    perform_inference_from_csvs,
+    kelong_model,
+    kelong_scaler,
+    kelong_label_map,
+    processed_model,
+    processed_scaler,
+    processed_feature_cols
+)
 
 # 忽略一些不必要的警告
 warnings.filterwarnings("ignore")
@@ -153,116 +170,94 @@ def preprocess_excel(file_path, scaler):
 # 4. 主程序
 # ===========================================================
 def main():
-    parser = argparse.ArgumentParser(description="猫行为识别 - 纯净版")
-    parser.add_argument("--input", type=str, required=True, help="文件路径")
-    parser.add_argument("--artifacts_dir", type=str, default="artifacts", help="模型目录")
+    parser = argparse.ArgumentParser(description="猫行为识别 - 双模型版本")
+    parser.add_argument("--input", type=str, required=True, help="原始IMU数据CSV文件路径（格式：sequence, timestamp, acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z）")
+    parser.add_argument("--output_dir", type=str, default=None, help="输出目录（可选，用于保存生成的特征文件）")
     args = parser.parse_args()
 
-    # 这里的 print 删除了
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # --- A. 加载配置和模型 ---
-    artifacts = Path(args.artifacts_dir)
-    
-    label_map_path = artifacts / "label_map.pkl"
-    if not label_map_path.exists():
-        print("❌ Error: 缺少 label_map.pkl")
-        return
-    with open(label_map_path, "rb") as f:
-        data = pickle.load(f)
-        idx_to_label = data["index_to_label"]
-        num_classes = len(idx_to_label)
-
-    scaler_path = artifacts / "scaler_fold0.pkl"
-    if not scaler_path.exists():
-        print("❌ Error: 缺少 scaler_fold0.pkl")
-        return
-    with open(scaler_path, "rb") as f:
-        scaler = pickle.load(f)
-
-    model0_path = artifacts / "best_model_fold0.pth"
-    if not model0_path.exists():
-         print("❌ Error: 缺少模型文件")
-         return
-         
-    ckpt = torch.load(model0_path, map_location=device)
-    base_channels = ckpt.get("base_channels", 128)
-    window_size = ckpt["window_size"]
-    
-    # 这里的 "加载模型中..." print 删除了
-    models = []
-    for fold in range(5):
-        p = artifacts / f"best_model_fold{fold}.pth"
-        if p.exists():
-            m = ResNet1D(in_channels=11, num_classes=num_classes, base_channels=base_channels, dropout=0.0).to(device)
-            state_dict = torch.load(p, map_location=device)["model_state_dict"]
-            m.load_state_dict(state_dict)
-            m.eval()
-            models.append(m)
-    
-    if not models:
-        print("❌ Error: 未加载到模型")
-        return
-
-    # --- B. 处理数据 ---
     input_path = Path(args.input)
-    # 这里的 "分析文件..." print 删除了
-    
-    data = preprocess_excel(input_path, scaler)
-    if data is None: 
-        print("❌ Error: 数据处理失败")
+    if not input_path.exists():
+        print(f"❌ Error: 文件不存在: {input_path}")
         return
-
-    # --- C. 切片 ---
-    T = data.shape[0]
-    step = window_size // 2  
-    windows = []
-
-    if T < window_size:
-        pad = np.zeros((window_size - T, 11), dtype=np.float32)
-        w = np.concatenate([data, pad], axis=0)
-        windows.append(w)
-    else:
-        for start in range(0, T - window_size + 1, step):
-            w = data[start : start + window_size]
-            windows.append(w)
-        if T > window_size and (T - window_size) % step != 0:
-            windows.append(data[-window_size:])
-
-    batch_input = np.array(windows) 
-    batch_input = np.transpose(batch_input, (0, 2, 1)) 
-    tensor_input = torch.tensor(batch_input).float().to(device)
-
-    # --- D. 推理 ---
-    # 这里的 "计算中..." print 删除了
-    with torch.no_grad():
-        ensemble_logits = torch.zeros((tensor_input.size(0), num_classes)).to(device)
-        for m in models:
-            logits = m(tensor_input)
-            probs = torch.softmax(logits, dim=1)
-            ensemble_logits += probs
+    
+    # 检查模型是否已加载
+    if kelong_model is None and processed_model is None:
+        print("❌ Error: 模型未加载，请检查模型文件路径")
+        return
+    
+    print(f"📂 读取文件: {input_path}")
+    
+    # --- A. 从CSV文件读取并转换为虚拟特征 ---
+    try:
+        timestamp_df, window_df = convert_csv_to_virtual_features(input_path)
+        print(f"✅ 成功生成特征:")
+        print(f"   - per_timestamp特征: {len(timestamp_df)} 行")
+        print(f"   - per_window特征: {len(window_df)} 行")
+    except Exception as e:
+        print(f"❌ Error: 特征转换失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    # --- B. 保存特征文件（可选）---
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
         
-        avg_probs = ensemble_logits / len(models)
-        file_final_prob = avg_probs.mean(dim=0)
-        pred_idx = torch.argmax(file_final_prob).item()
-        confidence = file_final_prob[pred_idx].item()
-
-    # --- E. 输出结果 ---
-    pred_label = idx_to_label[pred_idx]
-    display_label = pred_label.replace("大类_", "")
-
-    print("\n" + "="*40)
-    print(f"🐱 识别结果: 【 {display_label} 】")
-    print(f"🎯 置信度:   {confidence:.2%}")
-    print("="*40 + "\n")
-
-    print("--- 可能性排名 ---")
-    top3_vals, top3_idxs = torch.topk(file_final_prob, k=min(3, num_classes))
-    for i in range(len(top3_idxs)):
-        idx = top3_idxs[i].item()
-        score = top3_vals[i].item()
-        name = idx_to_label[idx].replace("大类_", "")
-        print(f"{i+1}. {name}: {score:.2%}")
+        base_name = input_path.stem
+        timestamp_csv = output_dir / f"{base_name}_virtual_per_timestamp_feature.csv"
+        window_csv = output_dir / f"{base_name}_virtual_per_window_feature.csv"
+        
+        timestamp_df.to_csv(timestamp_csv, index=False)
+        window_df.to_csv(window_csv, index=False)
+        print(f"💾 特征文件已保存:")
+        print(f"   - {timestamp_csv}")
+        print(f"   - {window_csv}")
+    else:
+        # 使用临时文件
+        import tempfile
+        temp_dir = Path(tempfile.gettempdir())
+        base_name = input_path.stem
+        timestamp_csv = temp_dir / f"{base_name}_virtual_per_timestamp_feature.csv"
+        window_csv = temp_dir / f"{base_name}_virtual_per_window_feature.csv"
+        
+        timestamp_df.to_csv(timestamp_csv, index=False)
+        window_df.to_csv(window_csv, index=False)
+    
+    # --- C. 执行推理 ---
+    print("\n🔍 执行推理...")
+    try:
+        inference_result = perform_inference_from_csvs(timestamp_csv, window_csv)
+        
+        if inference_result.get("status") == "error":
+            print(f"❌ Error: {inference_result.get('error', 'Unknown error')}")
+            return
+        
+        action = inference_result.get("action", "unknown")
+        confidence = inference_result.get("confidence", 0.0)
+        model_used = inference_result.get("model_used", "Unknown")
+        
+        # --- D. 输出结果 ---
+        print("\n" + "="*50)
+        print(f"🐱 识别结果: 【 {action} 】")
+        print(f"🎯 置信度:   {confidence:.2%}")
+        print(f"🤖 使用模型: {model_used}")
+        print("="*50 + "\n")
+        
+    except Exception as e:
+        print(f"❌ Error: 推理失败: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # 清理临时文件（如果不是用户指定的输出目录）
+        if not args.output_dir:
+            try:
+                if timestamp_csv.exists():
+                    timestamp_csv.unlink()
+                if window_csv.exists():
+                    window_csv.unlink()
+            except:
+                pass
 
 if __name__ == "__main__":
     main()

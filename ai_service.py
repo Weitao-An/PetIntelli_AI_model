@@ -6,12 +6,15 @@ import json
 import logging
 import pickle
 import time
-from typing import List, Any, Optional, Dict
+from typing import List, Any, Optional, Dict, Tuple
 import redis
 from datetime import datetime
 from pathlib import Path
 import os
 import tempfile
+from scipy import signal
+from scipy.stats import skew, kurtosis
+import sys
 
 # 配置日志
 logging.basicConfig(
@@ -25,6 +28,33 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", "artifacts"))
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "temp"))
 TEMP_DIR.mkdir(exist_ok=True)
+
+# 模型路径配置
+# Kelong模型路径（用于判断快速奔跑/缓慢走动）
+# 优先级：1. 环境变量 2. model_test目录 3. 当前目录下的kelong_artifacts
+_model_test_dir = Path(__file__).parent.parent / "model_test" / "kelong_artifacts"
+_current_kelong_dir = Path(__file__).parent / "kelong_artifacts"
+if os.getenv("KELONG_ARTIFACTS_DIR"):
+    KELONG_ARTIFACTS_DIR = Path(os.getenv("KELONG_ARTIFACTS_DIR"))
+elif _model_test_dir.exists():
+    KELONG_ARTIFACTS_DIR = _model_test_dir
+elif _current_kelong_dir.exists():
+    KELONG_ARTIFACTS_DIR = _current_kelong_dir
+else:
+    KELONG_ARTIFACTS_DIR = Path(os.getenv("KELONG_ARTIFACTS_DIR", "kelong_artifacts"))
+
+# Processed模型路径（用于判断安静休息/吃喝护理）
+# 优先级：1. 环境变量 2. model_test目录 3. 当前目录下的processed_models
+_processed_test_dir = Path(__file__).parent.parent / "model_test" / "processed_models"
+_current_processed_dir = Path(__file__).parent / "processed_models"
+if os.getenv("PROCESSED_MODELS_DIR"):
+    PROCESSED_MODELS_DIR = Path(os.getenv("PROCESSED_MODELS_DIR"))
+elif _processed_test_dir.exists():
+    PROCESSED_MODELS_DIR = _processed_test_dir
+elif _current_processed_dir.exists():
+    PROCESSED_MODELS_DIR = _current_processed_dir
+else:
+    PROCESSED_MODELS_DIR = Path(os.getenv("PROCESSED_MODELS_DIR", "processed_models"))
 
 # 特征列定义
 READ_COLS = [
@@ -151,58 +181,85 @@ class ResNet1D(nn.Module):
         return x
 
 # --- 3. 加载模型和配置 ---
-models = []
-label_map = {}
-scaler = None
-window_size = 125
-base_channels = 128
+# Kelong模型（用于判断快速奔跑/缓慢走动）
+kelong_model = None
+kelong_scaler = None
+kelong_label_map = {}
+kelong_window_size = 125
+
+# Processed模型（用于判断安静休息/吃喝护理）
+processed_model = None
+processed_scaler = None
+processed_selector = None
+processed_label_encoder = None
+processed_feature_cols = None
 
 try:
-    # 加载标签映射
-    label_map_path = ARTIFACTS_DIR / "label_map.pkl"
-    if label_map_path.exists():
-        with open(label_map_path, "rb") as f:
+    # 加载Kelong模型
+    kelong_label_map_path = KELONG_ARTIFACTS_DIR / "label_map.pkl"
+    if kelong_label_map_path.exists():
+        with open(kelong_label_map_path, "rb") as f:
             data = pickle.load(f)
-            label_map = data.get("index_to_label", {})
-            num_classes = len(label_map)
+            kelong_label_map = data.get("index_to_label", {})
+            kelong_num_classes = len(kelong_label_map)
+        
+        # 加载scaler
+        kelong_scaler_path = KELONG_ARTIFACTS_DIR / "scaler_fold0.pkl"
+        if kelong_scaler_path.exists():
+            with open(kelong_scaler_path, "rb") as f:
+                kelong_scaler = pickle.load(f)
+        
+        # 加载模型
+        kelong_model_path = KELONG_ARTIFACTS_DIR / "best_model_fold0.pth"
+        if kelong_model_path.exists():
+            ckpt = torch.load(kelong_model_path, map_location=DEVICE)
+            base_channels = ckpt.get("base_channels", 128)
+            kelong_window_size = ckpt.get("window_size", 125)
+            
+            kelong_model = ResNet1D(
+                in_channels=11, 
+                num_classes=kelong_num_classes, 
+                base_channels=base_channels, 
+                dropout=0.0
+            ).to(DEVICE)
+            kelong_model.load_state_dict(ckpt["model_state_dict"])
+            kelong_model.eval()
+            logger.info(f"成功加载Kelong模型到: {DEVICE}")
+        else:
+            logger.warning("Kelong模型文件不存在，将跳过Kelong模型推理")
     else:
-        logger.error("缺少 label_map.pkl")
+        logger.warning("Kelong模型配置不存在，将跳过Kelong模型推理")
+    
+    # 加载Processed模型
+    try:
+        import joblib
+        from sklearn.preprocessing import LabelEncoder
+        
+        processed_model_path = PROCESSED_MODELS_DIR / "processed_2class_model.pkl"
+        processed_scaler_path = PROCESSED_MODELS_DIR / "processed_2class_scaler.pkl"
+        processed_selector_path = PROCESSED_MODELS_DIR / "processed_2class_selector.pkl"
+        processed_le_path = PROCESSED_MODELS_DIR / "processed_2class_le.pkl"
+        processed_cols_path = PROCESSED_MODELS_DIR / "processed_2class_cols.pkl"
+        
+        if all(p.exists() for p in [processed_model_path, processed_scaler_path, 
+                                    processed_selector_path, processed_le_path, processed_cols_path]):
+            processed_model = joblib.load(processed_model_path)
+            processed_scaler = joblib.load(processed_scaler_path)
+            processed_selector = joblib.load(processed_selector_path)
+            processed_label_encoder = joblib.load(processed_le_path)
+            processed_feature_cols = joblib.load(processed_cols_path)
+            logger.info("成功加载Processed模型")
+        else:
+            logger.warning("Processed模型文件不完整，将跳过Processed模型推理")
+    except ImportError:
+        logger.warning("缺少joblib或sklearn，无法加载Processed模型")
+    except Exception as e:
+        logger.warning(f"加载Processed模型失败: {e}")
+    
+    if kelong_model is None and processed_model is None:
+        logger.error("未加载到任何模型，请检查模型文件路径")
         exit(1)
-    
-    # 加载scaler
-    scaler_path = ARTIFACTS_DIR / "scaler_fold0.pkl"
-    if scaler_path.exists():
-        with open(scaler_path, "rb") as f:
-            scaler = pickle.load(f)
-    else:
-        logger.error("缺少 scaler_fold0.pkl")
-        exit(1)
-    
-    # 加载模型配置
-    model0_path = ARTIFACTS_DIR / "best_model_fold0.pth"
-    if model0_path.exists():
-        ckpt = torch.load(model0_path, map_location=DEVICE)
-        base_channels = ckpt.get("base_channels", 128)
-        window_size = ckpt.get("window_size", 125)
-    else:
-        logger.error("缺少模型文件")
-        exit(1)
-    
-    # 加载所有fold的模型
-    for fold in range(5):
-        p = ARTIFACTS_DIR / f"best_model_fold{fold}.pth"
-        if p.exists():
-            m = ResNet1D(in_channels=11, num_classes=num_classes, base_channels=base_channels, dropout=0.0).to(DEVICE)
-            state_dict = torch.load(p, map_location=DEVICE)["model_state_dict"]
-            m.load_state_dict(state_dict)
-            m.eval()
-            models.append(m)
-    
-    if not models:
-        logger.error("未加载到模型")
-        exit(1)
-    
-    logger.info(f"成功加载 {len(models)} 个模型到: {DEVICE}")
+        
 except Exception as e:
     logger.error(f"模型加载失败: {e}")
     exit(1)
@@ -276,8 +333,18 @@ def convert_imu_to_virtual_features(imu_data: List[Dict], base_timestamp_ms: int
         # 转换为数值类型
         for col in required_cols:
             df[col] = pd.to_numeric(df[col], errors='coerce')
+    elif 'sequence' in df.columns:
+        # CSV文件格式：sequence, timestamp, acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z
+        required_cols = ['timestamp', 'acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"缺少必要的列（CSV格式）: {missing_cols}")
+        
+        # 转换为数值类型
+        for col in required_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
     else:
-        raise ValueError("无法识别IMU数据格式，需要包含 (ax,ay,az,gx,gy,gz,dt_ms) 或 (acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,timestamp)")
+        raise ValueError("无法识别IMU数据格式，需要包含 (ax,ay,az,gx,gy,gz,dt_ms) 或 (acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,timestamp) 或 (sequence,timestamp,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z)")
     
     # 按timestamp排序
     df = df.sort_values('timestamp').reset_index(drop=True)
@@ -336,7 +403,39 @@ def convert_imu_to_virtual_features(imu_data: List[Dict], base_timestamp_ms: int
             # RC高通滤波器: y[n] = alpha * (y[n-1] + x[n] - x[n-1])
             z_highpass[i] = alpha * (z_highpass[i-1] + linear_acc_z[i] - linear_acc_z[i-1])
     
-    # 构建结果DataFrame
+    # 计算角加速度（gyro的导数）
+    gyro_x = df['gyro_x'].values
+    gyro_y = df['gyro_y'].values
+    gyro_z = df['gyro_z'].values
+    
+    ang_acc_x = np.zeros_like(gyro_x)
+    ang_acc_y = np.zeros_like(gyro_y)
+    ang_acc_z = np.zeros_like(gyro_z)
+    
+    if len(gyro_x) > 1:
+        for i in range(1, len(gyro_x)):
+            if dt_values[i] > 0:
+                ang_acc_x[i] = (gyro_x[i] - gyro_x[i-1]) / dt_values[i]
+                ang_acc_y[i] = (gyro_y[i] - gyro_y[i-1]) / dt_values[i]
+                ang_acc_z[i] = (gyro_z[i] - gyro_z[i-1]) / dt_values[i]
+    
+    # 计算能量（加速度的平方）
+    energy_x = linear_acc_x ** 2
+    energy_y = linear_acc_y ** 2
+    energy_z = linear_acc_z ** 2
+    
+    # 计算剪切力
+    shear_xy = linear_acc_x * linear_acc_y
+    shear_xz = linear_acc_x * linear_acc_z
+    
+    # 计算向心力（假设虚拟半径r=1，根据图片描述）
+    # v_centripetal_x = r * (gy^2 + gz^2)
+    # v_centripetal_z = r * (gx^2 + gy^2)
+    r = 1.0  # 虚拟半径
+    centripetal_x = r * (gyro_y**2 + gyro_z**2)
+    centripetal_z = r * (gyro_x**2 + gyro_y**2)
+    
+    # 构建结果DataFrame（包含所有特征，与参考文件格式一致）
     result_df = pd.DataFrame({
         'timestamp': df['timestamp'].values,
         'v_pitch': pitch,
@@ -348,110 +447,398 @@ def convert_imu_to_virtual_features(imu_data: List[Dict], base_timestamp_ms: int
         'v_jerk_x': jerk_x,
         'v_jerk_y': jerk_y,
         'v_jerk_z': jerk_z,
+        'v_ang_acc_x': ang_acc_x,
+        'v_ang_acc_y': ang_acc_y,
+        'v_ang_acc_z': ang_acc_z,
+        'v_energy_x': energy_x,
+        'v_energy_y': energy_y,
+        'v_energy_z': energy_z,
+        'v_shear_xy': shear_xy,
+        'v_shear_xz': shear_xz,
+        'v_centripetal_x': centripetal_x,
+        'v_centripetal_z': centripetal_z,
         'v_z_highpass': z_highpass
     })
     
     return result_df
 
-# --- 5. 推理函数 ---
-def perform_inference_from_csv(csv_path: Path) -> Dict[str, Any]:
+# --- 4.1 计算per_window特征 ---
+def calculate_per_window_features(timestamp_df: pd.DataFrame) -> pd.DataFrame:
     """
-    从CSV文件执行推理
+    从per_timestamp特征计算per_window特征
     
     Args:
-        csv_path: 特征CSV文件路径
+        timestamp_df: 包含per_timestamp特征的DataFrame
+        
+    Returns:
+        包含per_window特征的DataFrame（单行）
+    """
+    if len(timestamp_df) == 0:
+        raise ValueError("时间序列数据为空")
+    
+    # 提取需要的列
+    v_pitch = timestamp_df['v_pitch'].values
+    v_roll = timestamp_df['v_roll'].values
+    v_yaw_rate = timestamp_df['v_yaw_rate'].values
+    v_linear_acc_x = timestamp_df['v_linear_acc_x'].values
+    v_linear_acc_y = timestamp_df['v_linear_acc_y'].values
+    v_linear_acc_z = timestamp_df['v_linear_acc_z'].values
+    v_z_highpass = timestamp_df['v_z_highpass'].values
+    v_jerk_z = timestamp_df['v_jerk_z'].values
+    
+    # 计算时间间隔（用于积分）
+    timestamps = timestamp_df['timestamp'].values
+    dt = np.diff(timestamps)
+    dt = np.concatenate([[dt[0] if len(dt) > 0 else 0.04], dt])  # 第一行使用默认值
+    dt = np.clip(dt, 0.001, 1.0)  # 限制在合理范围
+    
+    # 1. 姿态基准
+    v_pitch_mean = np.mean(v_pitch)
+    v_roll_mean = np.mean(v_roll)
+    
+    # 2. 姿态稳定
+    v_pitch_std = np.std(v_pitch)
+    v_roll_std = np.std(v_roll)
+    
+    # 3. 空间边界
+    v_pitch_max = np.max(v_pitch)
+    v_pitch_min = np.min(v_pitch)
+    v_roll_max = np.max(v_roll)
+    v_roll_min = np.min(v_roll)
+    
+    # 4. 空间包络
+    v_pitch_range = v_pitch_max - v_pitch_min
+    v_roll_range = v_roll_max - v_roll_min
+    
+    # 5. 转动累积
+    v_yaw_total = np.sum(np.abs(v_yaw_rate) * dt)
+    
+    # 6. 转动净值
+    v_yaw_net = np.sum(v_yaw_rate * dt)
+    
+    # 7. 时域强度
+    # v_rms_acc: RMS of acceleration magnitude
+    acc_mag = np.sqrt(v_linear_acc_x**2 + v_linear_acc_y**2 + v_linear_acc_z**2)
+    v_rms_acc = np.sqrt(np.mean(acc_mag**2))
+    
+    # v_sma_linear: Sum of absolute values of linear acceleration
+    v_sma_linear = np.sum(np.abs(v_linear_acc_x)) + np.sum(np.abs(v_linear_acc_y)) + np.sum(np.abs(v_linear_acc_z))
+    
+    # 8. 纹理节律
+    # v_z_zero_cross: Zero crossing rate of v_linear_acc_z
+    v_z_zero_cross = len(np.where(np.diff(np.signbit(v_linear_acc_z)))[0])
+    
+    # v_z_jerk_std: Standard deviation of v_jerk_z
+    v_z_jerk_std = np.std(v_jerk_z)
+    
+    # 9. 频域主频
+    # v_peak_freq: Peak frequency from FFT of v_linear_acc_z
+    if len(v_linear_acc_z) > 1:
+        # 计算采样率
+        sample_rate = 1.0 / np.mean(dt) if np.mean(dt) > 0 else 25.0
+        # FFT
+        fft_vals = np.fft.rfft(v_linear_acc_z)
+        fft_freq = np.fft.rfftfreq(len(v_linear_acc_z), 1.0/sample_rate)
+        # 找到主峰频率（排除DC分量）
+        power = np.abs(fft_vals[1:])**2
+        if len(power) > 0:
+            peak_idx = np.argmax(power) + 1
+            v_peak_freq = fft_freq[peak_idx] if peak_idx < len(fft_freq) else 0.0
+        else:
+            v_peak_freq = 0.0
+    else:
+        v_peak_freq = 0.0
+    
+    # 10. 频域分布
+    # v_spec_entropy: Spectral entropy
+    if len(v_linear_acc_z) > 1:
+        # 使用FFT计算功率谱
+        fft_vals = np.fft.rfft(v_linear_acc_z)
+        power = np.abs(fft_vals)**2
+        # 归一化
+        power_norm = power / (np.sum(power) + 1e-10)
+        # 计算熵
+        power_norm = power_norm[power_norm > 0]  # 只考虑非零值
+        v_spec_entropy = -np.sum(power_norm * np.log2(power_norm + 1e-10))
+    else:
+        v_spec_entropy = 0.0
+    
+    # v_low_freq_en: Low frequency energy (0-3Hz) proportion
+    if len(v_linear_acc_z) > 1:
+        sample_rate = 1.0 / np.mean(dt) if np.mean(dt) > 0 else 25.0
+        fft_vals = np.fft.rfft(v_linear_acc_z)
+        fft_freq = np.fft.rfftfreq(len(v_linear_acc_z), 1.0/sample_rate)
+        power = np.abs(fft_vals)**2
+        # 找到0-3Hz的能量
+        low_freq_mask = (fft_freq >= 0) & (fft_freq <= 3.0)
+        low_freq_energy = np.sum(power[low_freq_mask])
+        total_energy = np.sum(power)
+        v_low_freq_en = low_freq_energy / (total_energy + 1e-10)
+    else:
+        v_low_freq_en = 0.0
+    
+    # 11. 动力位移
+    # v_vel_x_max: Maximum velocity in x direction (integral of acceleration)
+    vel_x = np.cumsum(v_linear_acc_x * dt)
+    v_vel_x_max = np.max(np.abs(vel_x))
+    
+    # v_vel_z_var: Variance of velocity in z direction
+    vel_z = np.cumsum(v_linear_acc_z * dt)
+    v_vel_z_var = np.var(vel_z)
+    
+    # 12. 轴向耦合
+    # v_corr_xz: Pearson correlation between v_linear_acc_x and v_linear_acc_z
+    if len(v_linear_acc_x) > 1 and np.std(v_linear_acc_x) > 0 and np.std(v_linear_acc_z) > 0:
+        v_corr_xz = np.corrcoef(v_linear_acc_x, v_linear_acc_z)[0, 1]
+        if np.isnan(v_corr_xz):
+            v_corr_xz = 0.0
+    else:
+        v_corr_xz = 0.0
+    
+    # 13. 分布统计
+    # v_acc_skew: Skewness of acceleration magnitude
+    v_acc_skew = skew(acc_mag) if len(acc_mag) > 2 else 0.0
+    if np.isnan(v_acc_skew):
+        v_acc_skew = 0.0
+    
+    # v_acc_kurt: Kurtosis of acceleration magnitude
+    v_acc_kurt = kurtosis(acc_mag) if len(acc_mag) > 2 else 0.0
+    if np.isnan(v_acc_kurt):
+        v_acc_kurt = 0.0
+    
+    # 构建结果DataFrame
+    window_df = pd.DataFrame({
+        'v_pitch_mean': [v_pitch_mean],
+        'v_roll_mean': [v_roll_mean],
+        'v_pitch_std': [v_pitch_std],
+        'v_roll_std': [v_roll_std],
+        'v_pitch_max': [v_pitch_max],
+        'v_pitch_min': [v_pitch_min],
+        'v_roll_max': [v_roll_max],
+        'v_roll_min': [v_roll_min],
+        'v_pitch_range': [v_pitch_range],
+        'v_roll_range': [v_roll_range],
+        'v_yaw_total': [v_yaw_total],
+        'v_yaw_net': [v_yaw_net],
+        'v_rms_acc': [v_rms_acc],
+        'v_sma_linear': [v_sma_linear],
+        'v_z_zero_cross': [v_z_zero_cross],
+        'v_z_jerk_std': [v_z_jerk_std],
+        'v_peak_freq': [v_peak_freq],
+        'v_spec_entropy': [v_spec_entropy],
+        'v_low_freq_en': [v_low_freq_en],
+        'v_vel_x_max': [v_vel_x_max],
+        'v_vel_z_var': [v_vel_z_var],
+        'v_corr_xz': [v_corr_xz],
+        'v_acc_skew': [v_acc_skew],
+        'v_acc_kurt': [v_acc_kurt]
+    })
+    
+    return window_df
+
+# --- 4.2 从CSV文件读取并转换IMU数据 ---
+def convert_csv_to_virtual_features(csv_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    从CSV文件读取原始IMU数据，转换为虚拟坐标系特征，并生成两个特征文件
+    
+    Args:
+        csv_path: 原始IMU数据CSV文件路径（格式：sequence, timestamp, acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z）
+        
+    Returns:
+        (timestamp_df, window_df): 两个DataFrame，分别包含per_timestamp和per_window特征
+    """
+    # 读取CSV文件
+    df = pd.read_csv(csv_path)
+    
+    # 转换为字典列表格式（兼容convert_imu_to_virtual_features函数）
+    imu_data = df.to_dict('records')
+    
+    # 转换为虚拟坐标系特征
+    timestamp_df = convert_imu_to_virtual_features(imu_data, base_timestamp_ms=0)
+    
+    # 计算per_window特征
+    window_df = calculate_per_window_features(timestamp_df)
+    
+    return timestamp_df, window_df
+
+# --- 5. 推理函数 ---
+def perform_inference_from_csvs(timestamp_csv_path: Path, window_csv_path: Path) -> Dict[str, Any]:
+    """
+    从两个CSV文件执行推理（使用Kelong和Processed两个模型）
+    
+    Args:
+        timestamp_csv_path: per_timestamp特征CSV文件路径（用于Kelong模型）
+        window_csv_path: per_window特征CSV文件路径（用于Processed模型）
         
     Returns:
         包含推理结果的字典
     """
-    try:
-        # 读取CSV文件
-        df = pd.read_csv(csv_path)
-        
-        # 检查必要的列
-        missing = [c for c in READ_COLS if c not in df.columns]
-        if missing:
-            raise ValueError(f"CSV文件缺少必要的列: {missing}")
-        
-        # 提取特征列
-        df_subset = df[READ_COLS].copy()
-        for c in READ_COLS:
-            df_subset[c] = pd.to_numeric(df_subset[c], errors="coerce")
-        
-        # 处理缺失值
-        if df_subset.isna().any().any():
-            df_subset = df_subset.interpolate(method='linear').ffill().bfill()
-            df_subset = df_subset.fillna(0)
-        
-        # 计算加速度幅值
-        acc_x = df_subset["v_linear_acc_x"].to_numpy(dtype=np.float32)
-        acc_y = df_subset["v_linear_acc_y"].to_numpy(dtype=np.float32)
-        acc_z = df_subset["v_linear_acc_z"].to_numpy(dtype=np.float32)
-        acc_mag = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2).reshape(-1, 1)
-        
-        # 合并特征
-        data = df_subset.to_numpy(dtype=np.float32)
-        data = np.concatenate([data, acc_mag], axis=1)
-        
-        # 标准化
-        data_scaled = scaler.transform(data)
-        
-        # 滑动窗口切片
-        T = data_scaled.shape[0]
-        step = window_size // 2
-        windows = []
-        
-        if T < window_size:
-            pad = np.zeros((window_size - T, 11), dtype=np.float32)
-            w = np.concatenate([data_scaled, pad], axis=0)
-            windows.append(w)
-        else:
-            for start in range(0, T - window_size + 1, step):
-                w = data_scaled[start : start + window_size]
-                windows.append(w)
-            if T > window_size and (T - window_size) % step != 0:
-                windows.append(data_scaled[-window_size:])
-        
-        batch_input = np.array(windows)
-        batch_input = np.transpose(batch_input, (0, 2, 1))
-        tensor_input = torch.tensor(batch_input).float().to(DEVICE)
-        
-        # 推理
-        with torch.no_grad():
-            ensemble_logits = torch.zeros((tensor_input.size(0), len(label_map))).to(DEVICE)
-            for m in models:
-                logits = m(tensor_input)
-                probs = torch.softmax(logits, dim=1)
-                ensemble_logits += probs
+    kelong_result = None
+    processed_result = None
+    
+    # 1. Kelong模型推理（使用per_timestamp特征）
+    if kelong_model is not None and kelong_scaler is not None:
+        try:
+            df = pd.read_csv(timestamp_csv_path)
             
-            avg_probs = ensemble_logits / len(models)
-            file_final_prob = avg_probs.mean(dim=0)
-            pred_idx = torch.argmax(file_final_prob).item()
-            confidence = file_final_prob[pred_idx].item()
-        
-        # 获取预测标签
-        pred_label = label_map.get(pred_idx, "unknown")
-        display_label = pred_label.replace("大类_", "")
-        
-        result = {
-            "action": display_label,
-            "confidence": float(confidence),
-            "prediction_index": int(pred_idx),
+            # 检查必要的列
+            missing = [c for c in READ_COLS if c not in df.columns]
+            if missing:
+                raise ValueError(f"CSV文件缺少必要的列: {missing}")
+            
+            # 提取特征列
+            df_subset = df[READ_COLS].copy()
+            for c in READ_COLS:
+                df_subset[c] = pd.to_numeric(df_subset[c], errors="coerce")
+            
+            # 处理缺失值
+            if df_subset.isna().any().any():
+                df_subset = df_subset.interpolate(method='linear').ffill().bfill()
+                df_subset = df_subset.fillna(0)
+            
+            # 计算加速度幅值
+            acc_x = df_subset["v_linear_acc_x"].to_numpy(dtype=np.float32)
+            acc_y = df_subset["v_linear_acc_y"].to_numpy(dtype=np.float32)
+            acc_z = df_subset["v_linear_acc_z"].to_numpy(dtype=np.float32)
+            acc_mag = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2).reshape(-1, 1)
+            
+            # 合并特征
+            data = df_subset.to_numpy(dtype=np.float32)
+            data = np.concatenate([data, acc_mag], axis=1)
+            
+            # 标准化
+            data_scaled = kelong_scaler.transform(data)
+            
+            # 滑动窗口切片
+            T = data_scaled.shape[0]
+            step = kelong_window_size // 2
+            windows = []
+            
+            if T < kelong_window_size:
+                pad = np.zeros((kelong_window_size - T, 11), dtype=np.float32)
+                w = np.concatenate([data_scaled, pad], axis=0)
+                windows.append(w)
+            else:
+                for start in range(0, T - kelong_window_size + 1, step):
+                    w = data_scaled[start : start + kelong_window_size]
+                    windows.append(w)
+                if T > kelong_window_size and (T - kelong_window_size) % step != 0:
+                    windows.append(data_scaled[-kelong_window_size:])
+            
+            batch_input = np.array(windows)
+            batch_input = np.transpose(batch_input, (0, 2, 1))
+            tensor_input = torch.tensor(batch_input).float().to(DEVICE)
+            
+            # 推理
+            with torch.no_grad():
+                logits = kelong_model(tensor_input)
+                probs = torch.softmax(logits, dim=1)
+                avg_probs = probs.mean(dim=0)
+                pred_idx = torch.argmax(avg_probs).item()
+                confidence = avg_probs[pred_idx].item()
+            
+            # 获取预测标签
+            pred_label = kelong_label_map.get(pred_idx, "unknown")
+            
+            # 4类映射
+            if pred_label in ['大类_快速奔跑']:
+                class_4 = '快速奔跑'
+            elif pred_label in ['大类_缓慢走动']:
+                class_4 = '缓慢走动'
+            else:
+                class_4 = '其他'
+            
+            kelong_result = {
+                "original_label": pred_label,
+                "class_4": class_4,
+                "confidence": float(confidence),
+                "model": "Kelong"
+            }
+            
+            logger.info(f"Kelong模型推理成功 - Class: {class_4}, Confidence: {confidence:.2%}")
+        except Exception as e:
+            logger.warning(f"Kelong模型推理失败: {e}")
+    
+    # 2. Processed模型推理（使用per_window特征）
+    if processed_model is not None and processed_scaler is not None:
+        try:
+            df = pd.read_csv(window_csv_path)
+            
+            # 确保所有特征列存在
+            for col in processed_feature_cols:
+                if col not in df.columns:
+                    df[col] = 0
+            
+            # 选择特征列
+            df = df[processed_feature_cols]
+            
+            # 处理缺失值和异常值
+            df = df.replace([np.inf, -np.inf], np.nan)
+            df = df.fillna(df.median() if len(df) > 0 else 0)
+            
+            # 如果有多行，取第一行（保持DataFrame格式）
+            if len(df) > 0:
+                features_df = df.iloc[0:1].copy()  # 保持DataFrame格式，只取第一行
+            else:
+                raise ValueError("窗口特征数据为空")
+            
+            # 标准化（传入DataFrame以避免警告）
+            features_scaled = processed_scaler.transform(features_df)
+            
+            # 特征选择
+            features_sel = processed_selector.transform(features_scaled)
+            
+            # 预测
+            pred_idx = processed_model.predict(features_sel)[0]
+            pred_proba = processed_model.predict_proba(features_sel)[0]
+            pred_label = processed_label_encoder.inverse_transform([pred_idx])[0]
+            confidence = pred_proba[pred_idx]
+            
+            processed_result = {
+                "label": pred_label,
+                "confidence": float(confidence),
+                "model": "Processed"
+            }
+            
+            logger.info(f"Processed模型推理成功 - Label: {pred_label}, Confidence: {confidence:.2%}")
+        except Exception as e:
+            logger.warning(f"Processed模型推理失败: {e}")
+    
+    # 3. 混合预测逻辑
+    final_result = None
+    
+    # 如果Kelong预测为"快速奔跑"或"缓慢走动"，直接使用
+    if kelong_result and kelong_result['class_4'] in ['快速奔跑', '缓慢走动']:
+        final_result = {
+            "action": kelong_result['class_4'],
+            "confidence": kelong_result['confidence'],
+            "model_used": "Kelong",
             "status": "success"
         }
+    # 否则使用Processed模型
+    elif processed_result:
+        # 将Processed的预测映射到4类
+        if processed_result['label'] == '安静休息':
+            final_class = '安静休息'
+        else:  # 吃喝护理
+            final_class = '吃喝护理'
         
-        logger.info(f"推理成功 - Action: {display_label}, Confidence: {confidence:.2%}")
-        return result
-        
-    except Exception as e:
-        error_msg = f"推理出错: {str(e)}"
-        logger.error(f"推理失败: {error_msg}")
-        return {
+        final_result = {
+            "action": final_class,
+            "confidence": processed_result['confidence'],
+            "model_used": "Processed",
+            "status": "success"
+        }
+    else:
+        # 两个模型都失败
+        final_result = {
             "action": "unknown",
             "confidence": 0.0,
             "status": "error",
-            "error": error_msg
+            "error": "两个模型推理都失败"
         }
+    
+    return final_result
 
 # --- 6. Emotion 处理函数 ---
 def process_emotion(sound_osslink: str) -> dict:
@@ -828,7 +1215,7 @@ def process_stream_message(message_data: dict) -> dict:
         # 2.1 将IMU数据转换为虚拟坐标系特征
         try:
             # 传递基准时间戳（毫秒）用于新格式的时间戳计算
-            features_df = convert_imu_to_virtual_features(imu_samples, base_timestamp_ms=imu_timestamp)
+            timestamp_df = convert_imu_to_virtual_features(imu_samples, base_timestamp_ms=imu_timestamp)
         except Exception as e:
             logger.error(f"IMU数据转换失败 - NFC UID: {nfc_uid}, Error: {e}")
             ai_result["action"] = "error"
@@ -836,11 +1223,25 @@ def process_stream_message(message_data: dict) -> dict:
             ai_result["inference_error"] = str(e)
             return ai_result
         
-        # 2.2 保存为临时CSV文件
-        temp_csv_path = TEMP_DIR / f"{nfc_uid}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.csv"
+        # 2.2 计算per_window特征
         try:
-            features_df.to_csv(temp_csv_path, index=False)
-            logger.debug(f"特征CSV已保存: {temp_csv_path}")
+            window_df = calculate_per_window_features(timestamp_df)
+        except Exception as e:
+            logger.error(f"计算per_window特征失败 - NFC UID: {nfc_uid}, Error: {e}")
+            ai_result["action"] = "error"
+            ai_result["action_confidence"] = 0.0
+            ai_result["inference_error"] = f"per_window特征计算失败: {str(e)}"
+            return ai_result
+        
+        # 2.3 保存为两个临时CSV文件
+        timestamp_suffix = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        temp_timestamp_csv = TEMP_DIR / f"{nfc_uid}_{timestamp_suffix}_per_timestamp_feature.csv"
+        temp_window_csv = TEMP_DIR / f"{nfc_uid}_{timestamp_suffix}_per_window_feature.csv"
+        
+        try:
+            timestamp_df.to_csv(temp_timestamp_csv, index=False)
+            window_df.to_csv(temp_window_csv, index=False)
+            logger.debug(f"特征CSV已保存: {temp_timestamp_csv}, {temp_window_csv}")
         except Exception as e:
             logger.error(f"保存CSV文件失败 - NFC UID: {nfc_uid}, Error: {e}")
             ai_result["action"] = "error"
@@ -848,9 +1249,9 @@ def process_stream_message(message_data: dict) -> dict:
             ai_result["inference_error"] = f"CSV保存失败: {str(e)}"
             return ai_result
         
-        # 2.3 执行推理
+        # 2.4 执行推理（使用两个模型）
         try:
-            inference_result = perform_inference_from_csv(temp_csv_path)
+            inference_result = perform_inference_from_csvs(temp_timestamp_csv, temp_window_csv)
             ai_result["action"] = inference_result.get("action", "unknown")
             ai_result["action_confidence"] = inference_result.get("confidence", 0.0)
             
@@ -864,8 +1265,10 @@ def process_stream_message(message_data: dict) -> dict:
         finally:
             # 清理临时文件
             try:
-                if temp_csv_path.exists():
-                    temp_csv_path.unlink()
+                if temp_timestamp_csv.exists():
+                    temp_timestamp_csv.unlink()
+                if temp_window_csv.exists():
+                    temp_window_csv.unlink()
             except Exception as e:
                 logger.warning(f"清理临时文件失败: {e}")
         
@@ -1037,7 +1440,8 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info(f"环境: {ENV}")
     logger.info(f"模型设备: {DEVICE}")
-    logger.info(f"已加载模型数量: {len(models)}")
+    logger.info(f"Kelong模型: {'已加载' if kelong_model is not None else '未加载'}")
+    logger.info(f"Processed模型: {'已加载' if processed_model is not None else '未加载'}")
     logger.info(f"Redis 服务器: {REDIS_HOST}:{REDIS_PORT}")
     logger.info(f"Redis Stream: {REDIS_STREAM_TELEMETRY}")
     logger.info(f"Consumer Group: {REDIS_STREAM_CONSUMER_GROUP}")
