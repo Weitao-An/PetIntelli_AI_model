@@ -98,6 +98,11 @@ REDIS_STREAM_CONSUMER_NAME = f"ai_worker_{os.getpid()}"  # 消费者名称（使
 REDIS_KEY_DEV_LATEST = f"{REDIS_KEY_PREFIX}:dev:{{nfc_uid}}:latest"  # Hash Key
 REDIS_PUB_CHANNEL = f"{REDIS_KEY_PREFIX}:pub:{{nfc_uid}}"  # Pub/Sub 频道
 
+# --- 设备时间戳缓存（用于过滤旧数据）---
+# 存储每个nfc_uid的最新dev_ts_ms，避免处理旧数据
+_device_timestamp_cache: Dict[str, int] = {}
+_MAX_CACHE_SIZE = 10000  # 最大缓存设备数量，防止内存无限增长
+
 
 # --- 2. 模型定义 ---
 class SEBlock(nn.Module):
@@ -662,13 +667,13 @@ def convert_csv_to_virtual_features(csv_path: Path) -> Tuple[pd.DataFrame, pd.Da
     return timestamp_df, window_df
 
 # --- 5. 推理函数 ---
-def perform_inference_from_csvs(timestamp_csv_path: Path, window_csv_path: Path) -> Dict[str, Any]:
+def perform_inference_from_dataframes(timestamp_df: pd.DataFrame, window_df: pd.DataFrame) -> Dict[str, Any]:
     """
-    从两个CSV文件执行推理（使用Kelong和Processed两个模型）
+    直接从DataFrame执行推理（避免文件I/O，提升性能）
     
     Args:
-        timestamp_csv_path: per_timestamp特征CSV文件路径（用于Kelong模型）
-        window_csv_path: per_window特征CSV文件路径（用于Processed模型）
+        timestamp_df: per_timestamp特征DataFrame
+        window_df: per_window特征DataFrame
         
     Returns:
         包含推理结果的字典
@@ -679,12 +684,12 @@ def perform_inference_from_csvs(timestamp_csv_path: Path, window_csv_path: Path)
     # 1. Kelong模型推理（使用per_timestamp特征）
     if kelong_model is not None and kelong_scaler is not None:
         try:
-            df = pd.read_csv(timestamp_csv_path)
+            df = timestamp_df.copy()
             
             # 检查必要的列
             missing = [c for c in READ_COLS if c not in df.columns]
             if missing:
-                raise ValueError(f"CSV文件缺少必要的列: {missing}")
+                raise ValueError(f"DataFrame缺少必要的列: {missing}")
             
             # 提取特征列
             df_subset = df[READ_COLS].copy()
@@ -762,7 +767,7 @@ def perform_inference_from_csvs(timestamp_csv_path: Path, window_csv_path: Path)
     # 2. Processed模型推理（使用per_window特征）
     if processed_model is not None and processed_scaler is not None:
         try:
-            df = pd.read_csv(window_csv_path)
+            df = window_df.copy()
             
             # 确保所有特征列存在
             for col in processed_feature_cols:
@@ -839,6 +844,24 @@ def perform_inference_from_csvs(timestamp_csv_path: Path, window_csv_path: Path)
         }
     
     return final_result
+
+def perform_inference_from_csvs(timestamp_csv_path: Path, window_csv_path: Path) -> Dict[str, Any]:
+    """
+    从两个CSV文件执行推理（使用Kelong和Processed两个模型）
+    
+    Args:
+        timestamp_csv_path: per_timestamp特征CSV文件路径（用于Kelong模型）
+        window_csv_path: per_window特征CSV文件路径（用于Processed模型）
+        
+    Returns:
+        包含推理结果的字典
+    """
+    # 读取CSV文件并转换为DataFrame
+    timestamp_df = pd.read_csv(timestamp_csv_path)
+    window_df = pd.read_csv(window_csv_path)
+    
+    # 调用优化后的函数（避免重复代码）
+    return perform_inference_from_dataframes(timestamp_df, window_df)
 
 # --- 6. Emotion 处理函数 ---
 def process_emotion(sound_osslink: str) -> dict:
@@ -1077,7 +1100,7 @@ def publish_ai_result(client: redis.Redis, nfc_uid: str, ai_result: dict):
         return False
 
 # --- 10. 处理 Stream 消息数据 ---
-def process_stream_message(message_data: dict) -> dict:
+def process_stream_message(message_data: dict) -> Optional[dict]:
     """
     处理从 Redis Stream 获取的消息数据
     
@@ -1094,13 +1117,14 @@ def process_stream_message(message_data: dict) -> dict:
         
     Returns:
         AI 处理结果字典（包含 emotion_state, emotion_score, action 等字段）
+        如果数据是旧的（时间戳 <= 上次），返回 None 表示跳过
     """
     try:
         # 解析消息顶层字段
         nfc_uid = message_data.get("nfc_uid", "unknown")
         dev_ts_ms = message_data.get("dev_ts_ms", 0)
         
-        logger.info(f"开始处理 Stream 消息 - NFC UID: {nfc_uid}, Dev TS: {dev_ts_ms}")
+        logger.info(f"收到 Stream 消息 - NFC UID: {nfc_uid}, Dev TS: {dev_ts_ms}")
         
         # 如果 message_data 是字符串，先解析 JSON
         if isinstance(message_data, str):
@@ -1159,6 +1183,30 @@ def process_stream_message(message_data: dict) -> dict:
             # 没有 data 字段，直接从顶层获取 items（兼容旧格式）
             items = message_data.get("items", [])
             logger.info(f"从顶层获取 Items 数量: {len(items)}")
+        
+        # 在解析完所有字段后，检查时间戳（因为dev_ts_ms可能在data字段中）
+        # 只对有效的nfc_uid和时间戳进行检查
+        if nfc_uid != "unknown" and dev_ts_ms > 0:
+            last_ts = _device_timestamp_cache.get(nfc_uid, 0)
+            if dev_ts_ms <= last_ts:
+                logger.debug(f"跳过旧数据 - NFC UID: {nfc_uid}, Dev TS: {dev_ts_ms} (上次: {last_ts}, 差值: {dev_ts_ms - last_ts}ms)")
+                return None  # 返回None表示跳过处理
+            
+            # 更新缓存
+            _device_timestamp_cache[nfc_uid] = dev_ts_ms
+            
+            # 如果缓存过大，清理最旧的条目（简单的FIFO策略）
+            if len(_device_timestamp_cache) > _MAX_CACHE_SIZE:
+                # 删除最旧的10%条目（简单实现：删除前10%）
+                items_to_remove = list(_device_timestamp_cache.items())[:len(_device_timestamp_cache) // 10]
+                for uid, _ in items_to_remove:
+                    _device_timestamp_cache.pop(uid, None)
+                logger.debug(f"清理时间戳缓存，当前大小: {len(_device_timestamp_cache)}")
+            
+            logger.debug(f"更新时间戳缓存 - NFC UID: {nfc_uid}, Dev TS: {dev_ts_ms} (上次: {last_ts})")
+        elif dev_ts_ms <= 0:
+            # 时间戳无效，记录警告但继续处理（可能是第一次或时间戳缺失）
+            logger.warning(f"收到无效时间戳 - NFC UID: {nfc_uid}, Dev TS: {dev_ts_ms}，将继续处理")
         imu_item = None
         audio_meta_item = None
         
@@ -1233,25 +1281,9 @@ def process_stream_message(message_data: dict) -> dict:
             ai_result["inference_error"] = f"per_window特征计算失败: {str(e)}"
             return ai_result
         
-        # 2.3 保存为两个临时CSV文件
-        timestamp_suffix = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-        temp_timestamp_csv = TEMP_DIR / f"{nfc_uid}_{timestamp_suffix}_per_timestamp_feature.csv"
-        temp_window_csv = TEMP_DIR / f"{nfc_uid}_{timestamp_suffix}_per_window_feature.csv"
-        
+        # 2.3 执行推理（直接使用DataFrame，避免文件I/O提升性能）
         try:
-            timestamp_df.to_csv(temp_timestamp_csv, index=False)
-            window_df.to_csv(temp_window_csv, index=False)
-            logger.debug(f"特征CSV已保存: {temp_timestamp_csv}, {temp_window_csv}")
-        except Exception as e:
-            logger.error(f"保存CSV文件失败 - NFC UID: {nfc_uid}, Error: {e}")
-            ai_result["action"] = "error"
-            ai_result["action_confidence"] = 0.0
-            ai_result["inference_error"] = f"CSV保存失败: {str(e)}"
-            return ai_result
-        
-        # 2.4 执行推理（使用两个模型）
-        try:
-            inference_result = perform_inference_from_csvs(temp_timestamp_csv, temp_window_csv)
+            inference_result = perform_inference_from_dataframes(timestamp_df, window_df)
             ai_result["action"] = inference_result.get("action", "unknown")
             ai_result["action_confidence"] = inference_result.get("confidence", 0.0)
             
@@ -1262,15 +1294,6 @@ def process_stream_message(message_data: dict) -> dict:
             ai_result["action"] = "error"
             ai_result["action_confidence"] = 0.0
             ai_result["inference_error"] = str(e)
-        finally:
-            # 清理临时文件
-            try:
-                if temp_timestamp_csv.exists():
-                    temp_timestamp_csv.unlink()
-                if temp_window_csv.exists():
-                    temp_window_csv.unlink()
-            except Exception as e:
-                logger.warning(f"清理临时文件失败: {e}")
         
         logger.info(f"处理完成 - NFC UID: {nfc_uid}, Action: {ai_result.get('action')}, Confidence: {ai_result.get('action_confidence', 0):.2%}, Emotion: {ai_result.get('emotion_state')}")
         return ai_result
@@ -1372,6 +1395,18 @@ def redis_stream_consumer_loop():
                                 pass  # 不是 JSON，使用原始数据
                         
                         ai_result = process_stream_message(parsed_data)
+                        
+                        # 如果返回None，表示是旧数据，直接跳过
+                        if ai_result is None:
+                            # 确认消息（跳过旧数据也需要确认，避免消息堆积）
+                            redis_client.xack(
+                                REDIS_STREAM_TELEMETRY,
+                                REDIS_STREAM_CONSUMER_GROUP,
+                                message_id
+                            )
+                            logger.debug(f"跳过旧数据，消息已确认 - Message ID: {message_id}")
+                            continue
+                        
                         nfc_uid = ai_result.get("nfc_uid", "unknown")
                         
                         # 使用 update_latest_field 逐个更新 Redis Hash 字段
