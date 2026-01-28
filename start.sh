@@ -26,23 +26,37 @@ export REDIS_DECODE=${REDIS_DECODE:-False}
 export TEMP_DIR=${TEMP_DIR:-$SCRIPT_DIR/temp}
 export LOG_LEVEL=${LOG_LEVEL:-INFO}
 
-# 模型目录配置（二分类模型：吃饭喝水 vs 安静休息）
-# 优先级：1. 环境变量 2. 服务器路径 3. 父目录下的deployment文件夹 4. 当前目录下的deployment文件夹
-if [ -n "$DEPLOYMENT_MODEL_DIR" ]; then
-    export DEPLOYMENT_MODEL_DIR="$DEPLOYMENT_MODEL_DIR"
-elif [ -d "/home/yan/二分类" ]; then
-    export DEPLOYMENT_MODEL_DIR="/home/yan/二分类"
+# 模型目录配置（嵌套模型：四分类 + 二分类）
+# 第一层：四分类模型路径
+if [ -n "$FOUR_CLASS_MODEL_DIR" ]; then
+    export FOUR_CLASS_MODEL_DIR="$FOUR_CLASS_MODEL_DIR"
+elif [ -d "/home/Drame/Analysis/deployment" ]; then
+    export FOUR_CLASS_MODEL_DIR="/home/Drame/Analysis/deployment"
 elif [ -d "$SCRIPT_DIR/../deployment" ]; then
-    export DEPLOYMENT_MODEL_DIR="$(cd "$SCRIPT_DIR/../deployment" && pwd)"
+    export FOUR_CLASS_MODEL_DIR="$(cd "$SCRIPT_DIR/../deployment" && pwd)"
 elif [ -d "$SCRIPT_DIR/deployment" ]; then
-    export DEPLOYMENT_MODEL_DIR="$SCRIPT_DIR/deployment"
+    export FOUR_CLASS_MODEL_DIR="$SCRIPT_DIR/deployment"
 else
-    export DEPLOYMENT_MODEL_DIR="/home/yan/二分类"
+    export FOUR_CLASS_MODEL_DIR="/home/Drame/Analysis/deployment"
+fi
+
+# 第二层：二分类模型路径
+if [ -n "$BINARY_MODEL_DIR" ]; then
+    export BINARY_MODEL_DIR="$BINARY_MODEL_DIR"
+elif [ -d "/home/yan/二分类" ]; then
+    export BINARY_MODEL_DIR="/home/yan/二分类"
+elif [ -d "$SCRIPT_DIR/../deployment" ]; then
+    export BINARY_MODEL_DIR="$(cd "$SCRIPT_DIR/../deployment" && pwd)"
+elif [ -d "$SCRIPT_DIR/deployment" ]; then
+    export BINARY_MODEL_DIR="$SCRIPT_DIR/deployment"
+else
+    export BINARY_MODEL_DIR="/home/yan/二分类"
 fi
 
 # 创建必要的目录
 mkdir -p "$TEMP_DIR"
-mkdir -p "$DEPLOYMENT_MODEL_DIR"
+mkdir -p "$FOUR_CLASS_MODEL_DIR"
+mkdir -p "$BINARY_MODEL_DIR"
 
 # 检查 Python
 if ! command -v python3 &> /dev/null; then
@@ -51,30 +65,45 @@ if ! command -v python3 &> /dev/null; then
 fi
 
 # 检查模型文件
-MODEL_FOUND=false
-
-# 检查二分类模型文件（.joblib 或 .pkl）
-if [ -d "$DEPLOYMENT_MODEL_DIR" ]; then
-    # 查找模型文件
-    MODEL_FILE=$(find "$DEPLOYMENT_MODEL_DIR" -maxdepth 1 -name "*.joblib" -o -name "*.pkl" | head -n 1)
-    if [ -n "$MODEL_FILE" ] && [ -f "$MODEL_FILE" ]; then
-        MODEL_FOUND=true
-        echo "✓ 二分类模型文件已找到: $MODEL_FILE"
+# 检查四分类模型文件
+if [ -d "$FOUR_CLASS_MODEL_DIR" ]; then
+    if [ -f "$FOUR_CLASS_MODEL_DIR/rf_model.pkl" ] && \
+       [ -f "$FOUR_CLASS_MODEL_DIR/scaler.pkl" ] && \
+       [ -f "$FOUR_CLASS_MODEL_DIR/model_metadata.json" ]; then
+        echo "✓ 四分类模型文件已找到: $FOUR_CLASS_MODEL_DIR"
     else
-        echo "错误: 模型文件不存在，请确保目录中存在 .joblib 或 .pkl 文件："
-        echo "  - $DEPLOYMENT_MODEL_DIR"
+        echo "错误: 四分类模型文件不完整，请确保以下文件存在："
+        echo "  - $FOUR_CLASS_MODEL_DIR/rf_model.pkl"
+        echo "  - $FOUR_CLASS_MODEL_DIR/scaler.pkl"
+        echo "  - $FOUR_CLASS_MODEL_DIR/model_metadata.json"
         exit 1
     fi
 else
-    echo "错误: 模型目录不存在: $DEPLOYMENT_MODEL_DIR"
+    echo "错误: 四分类模型目录不存在: $FOUR_CLASS_MODEL_DIR"
+    exit 1
+fi
+
+# 检查二分类模型文件（.joblib 或 .pkl）
+if [ -d "$BINARY_MODEL_DIR" ]; then
+    BINARY_MODEL_FILE=$(find "$BINARY_MODEL_DIR" -maxdepth 1 \( -name "*.joblib" -o -name "*.pkl" \) | head -n 1)
+    if [ -n "$BINARY_MODEL_FILE" ] && [ -f "$BINARY_MODEL_FILE" ]; then
+        echo "✓ 二分类模型文件已找到: $BINARY_MODEL_FILE"
+    else
+        echo "错误: 二分类模型文件不存在，请确保目录中存在 .joblib 或 .pkl 文件："
+        echo "  - $BINARY_MODEL_DIR"
+        exit 1
+    fi
+else
+    echo "错误: 二分类模型目录不存在: $BINARY_MODEL_DIR"
     exit 1
 fi
 
 # 启动服务
 echo "=========================================="
-echo "启动 AI 模型服务（二分类模型：吃饭喝水 vs 安静休息）..."
+echo "启动 AI 模型服务（嵌套模型：四分类 + 二分类）..."
 echo "环境: $ENV"
 echo "Redis: $REDIS_HOST:$REDIS_PORT"
-echo "模型目录: $DEPLOYMENT_MODEL_DIR"
+echo "第一层模型目录（四分类）: $FOUR_CLASS_MODEL_DIR"
+echo "第二层模型目录（二分类）: $BINARY_MODEL_DIR"
 echo "=========================================="
 python3 ai_service.py

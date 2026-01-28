@@ -23,21 +23,36 @@ logger = logging.getLogger(__name__)
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "temp"))
 TEMP_DIR.mkdir(exist_ok=True)
 
-# 模型路径配置（二分类模型：吃饭喝水 vs 安静休息）
-# 优先级：1. 环境变量 2. 服务器路径 3. 父目录下的deployment文件夹 4. 当前目录下的deployment文件夹
-_deployment_server_dir = Path("/home/yan/二分类")
-_deployment_parent_dir = Path(__file__).parent.parent / "deployment"
-_deployment_current_dir = Path(__file__).parent / "deployment"
-if os.getenv("DEPLOYMENT_MODEL_DIR"):
-    DEPLOYMENT_MODEL_DIR = Path(os.getenv("DEPLOYMENT_MODEL_DIR"))
-elif _deployment_server_dir.exists():
-    DEPLOYMENT_MODEL_DIR = _deployment_server_dir
-elif _deployment_parent_dir.exists():
-    DEPLOYMENT_MODEL_DIR = _deployment_parent_dir
-elif _deployment_current_dir.exists():
-    DEPLOYMENT_MODEL_DIR = _deployment_current_dir
+# 模型路径配置（嵌套模型：四分类 + 二分类）
+# 第一层：四分类模型路径（用于初步判断）
+_four_class_server_dir = Path("/home/Drame/Analysis/deployment")
+_four_class_parent_dir = Path(__file__).parent.parent / "deployment"
+_four_class_current_dir = Path(__file__).parent / "deployment"
+if os.getenv("FOUR_CLASS_MODEL_DIR"):
+    FOUR_CLASS_MODEL_DIR = Path(os.getenv("FOUR_CLASS_MODEL_DIR"))
+elif _four_class_server_dir.exists():
+    FOUR_CLASS_MODEL_DIR = _four_class_server_dir
+elif _four_class_parent_dir.exists():
+    FOUR_CLASS_MODEL_DIR = _four_class_parent_dir
+elif _four_class_current_dir.exists():
+    FOUR_CLASS_MODEL_DIR = _four_class_current_dir
 else:
-    DEPLOYMENT_MODEL_DIR = Path(os.getenv("DEPLOYMENT_MODEL_DIR", "/home/yan/二分类"))
+    FOUR_CLASS_MODEL_DIR = Path(os.getenv("FOUR_CLASS_MODEL_DIR", "/home/Drame/Analysis/deployment"))
+
+# 第二层：二分类模型路径（用于"安静休息"的二次判断）
+_binary_server_dir = Path("/home/yan/二分类")
+_binary_parent_dir = Path(__file__).parent.parent / "deployment"
+_binary_current_dir = Path(__file__).parent / "deployment"
+if os.getenv("BINARY_MODEL_DIR"):
+    BINARY_MODEL_DIR = Path(os.getenv("BINARY_MODEL_DIR"))
+elif _binary_server_dir.exists():
+    BINARY_MODEL_DIR = _binary_server_dir
+elif _binary_parent_dir.exists():
+    BINARY_MODEL_DIR = _binary_parent_dir
+elif _binary_current_dir.exists():
+    BINARY_MODEL_DIR = _binary_current_dir
+else:
+    BINARY_MODEL_DIR = Path(os.getenv("BINARY_MODEL_DIR", "/home/yan/二分类"))
 
 # --- 环境配置（参考 constants.py 规范）---
 ENV = os.getenv("ENV", "dev")  # 环境标识：dev/test/prod
@@ -73,7 +88,16 @@ _MAX_CACHE_SIZE = 10000  # 最大缓存设备数量，防止内存无限增长
 
 
 # --- 2. 加载模型和配置 ---
-# 二分类模型（吃饭喝水 vs 安静休息）
+# 嵌套模型：四分类模型（第一层） + 二分类模型（第二层，用于"安静休息"的二次判断）
+
+# 第一层：四分类模型（RandomForest）
+four_class_model = None
+four_class_scaler = None
+four_class_metadata = None
+four_class_confidence_threshold = 0.4
+four_class_feature_names = None
+
+# 第二层：二分类模型（吃饭喝水 vs 安静休息）
 
 # CatIMUClassifier 类定义（用于 joblib 加载模型）
 class CatIMUClassifier(BaseEstimator, ClassifierMixin):
@@ -194,26 +218,69 @@ LABEL_MAP = {
 try:
     import joblib
     
-    # 查找模型文件（可能是 .joblib 或 .pkl）
-    model_files = list(DEPLOYMENT_MODEL_DIR.glob("*.joblib")) + list(DEPLOYMENT_MODEL_DIR.glob("*.pkl"))
-    if not model_files:
-        logger.error(f"模型文件不存在，请检查目录: {DEPLOYMENT_MODEL_DIR}")
+    # ===== 第一层：加载四分类模型 =====
+    logger.info("=" * 60)
+    logger.info("加载第一层模型：四分类模型（RandomForest）")
+    logger.info("=" * 60)
+    
+    four_class_model_path = FOUR_CLASS_MODEL_DIR / "rf_model.pkl"
+    four_class_scaler_path = FOUR_CLASS_MODEL_DIR / "scaler.pkl"
+    four_class_metadata_path = FOUR_CLASS_MODEL_DIR / "model_metadata.json"
+    
+    if not four_class_model_path.exists():
+        logger.error(f"四分类模型文件不存在: {four_class_model_path}")
+        exit(1)
+    if not four_class_scaler_path.exists():
+        logger.error(f"四分类标准化器文件不存在: {four_class_scaler_path}")
+        exit(1)
+    if not four_class_metadata_path.exists():
+        logger.error(f"四分类元数据文件不存在: {four_class_metadata_path}")
+        exit(1)
+    
+    # 加载四分类模型和标准化器
+    four_class_model = joblib.load(four_class_model_path)
+    four_class_scaler = joblib.load(four_class_scaler_path)
+    
+    # 加载元数据
+    with open(four_class_metadata_path, 'r', encoding='utf-8') as f:
+        four_class_metadata = json.load(f)
+    
+    four_class_confidence_threshold = four_class_metadata.get("confidence_threshold", 0.4)
+    four_class_feature_names = four_class_metadata.get("feature_names", [])
+    
+    logger.info(f"成功加载四分类模型")
+    logger.info(f"  - 模型类型: {four_class_metadata.get('model_type', 'Unknown')}")
+    logger.info(f"  - 置信度阈值: {four_class_confidence_threshold}")
+    logger.info(f"  - 特征数量: {len(four_class_feature_names)}")
+    logger.info(f"  - 三个已知类别: {four_class_metadata.get('three_classes', [])}")
+    logger.info(f"  - 四分类（包含'玩耍捕猎'）: {four_class_metadata.get('four_classes', [])}")
+    logger.info(f"  - 模型路径: {FOUR_CLASS_MODEL_DIR}")
+    
+    # ===== 第二层：加载二分类模型 =====
+    logger.info("=" * 60)
+    logger.info("加载第二层模型：二分类模型（吃饭喝水 vs 安静休息）")
+    logger.info("=" * 60)
+    
+    # 查找二分类模型文件（可能是 .joblib 或 .pkl）
+    binary_model_files = list(BINARY_MODEL_DIR.glob("*.joblib")) + list(BINARY_MODEL_DIR.glob("*.pkl"))
+    if not binary_model_files:
+        logger.error(f"二分类模型文件不存在，请检查目录: {BINARY_MODEL_DIR}")
         exit(1)
     
     # 使用第一个找到的模型文件
-    model_path = model_files[0]
-    logger.info(f"加载模型文件: {model_path}")
+    binary_model_path = binary_model_files[0]
+    logger.info(f"加载二分类模型文件: {binary_model_path}")
     
-    # 加载模型（可能是字典格式，包含 'model' 和 'threshold'）
-    model_bundle = joblib.load(model_path)
+    # 加载二分类模型（可能是字典格式，包含 'model' 和 'threshold'）
+    binary_model_bundle = joblib.load(binary_model_path)
     
-    if isinstance(model_bundle, dict) and 'model' in model_bundle:
-        binary_model = model_bundle['model']
-        prediction_threshold = model_bundle.get('threshold', 0.5)
-        logger.info(f"从模型包中加载模型和阈值: {prediction_threshold}")
+    if isinstance(binary_model_bundle, dict) and 'model' in binary_model_bundle:
+        binary_model = binary_model_bundle['model']
+        prediction_threshold = binary_model_bundle.get('threshold', 0.5)
+        logger.info(f"从模型包中加载二分类模型和阈值: {prediction_threshold}")
     else:
         # 如果不是字典格式，直接使用
-        binary_model = model_bundle
+        binary_model = binary_model_bundle
         prediction_threshold = 0.5
         logger.info("使用默认阈值: 0.5")
     
@@ -222,7 +289,8 @@ try:
     logger.info(f"  - 预测阈值: {prediction_threshold}")
     logger.info(f"  - 特征数量: {len(feature_names)}")
     logger.info(f"  - 分类: {list(LABEL_MAP.values())}")
-    logger.info(f"  - 模型路径: {DEPLOYMENT_MODEL_DIR}")
+    logger.info(f"  - 模型路径: {BINARY_MODEL_DIR}")
+    logger.info("=" * 60)
     
 except ImportError as e:
     error_msg = str(e)
@@ -645,7 +713,7 @@ def convert_csv_to_virtual_features(csv_path: Path) -> Tuple[pd.DataFrame, pd.Da
 # --- 5. 推理函数 ---
 def perform_inference_from_dataframes(timestamp_df: pd.DataFrame, window_df: pd.DataFrame) -> Dict[str, Any]:
     """
-    直接从DataFrame执行推理（使用二分类模型：吃饭喝水 vs 安静休息）
+    嵌套模型推理：先使用四分类模型，如果结果是"安静休息"，再用二分类模型进行二次判断
     
     Args:
         timestamp_df: per_timestamp特征DataFrame（未使用，保留兼容性）
@@ -654,61 +722,126 @@ def perform_inference_from_dataframes(timestamp_df: pd.DataFrame, window_df: pd.
     Returns:
         包含推理结果的字典
     """
-    if binary_model is None:
+    if four_class_model is None or four_class_scaler is None:
         return {
             "action": "error",
             "confidence": 0.0,
             "status": "error",
-            "error": "模型未加载"
+            "error": "四分类模型未加载"
         }
     
     try:
         df = window_df.copy()
         
-        # 确保所有特征列存在
-        for col in feature_names:
+        # ===== 第一层：四分类模型推理 =====
+        # 准备四分类模型的特征
+        for col in four_class_feature_names:
             if col not in df.columns:
-                logger.warning(f"特征列 {col} 不存在，将填充为0")
+                logger.warning(f"四分类模型特征列 {col} 不存在，将填充为0")
                 df[col] = 0.0
         
-        # 选择特征列（按模型期望的顺序）
-        X_pred = df[feature_names].copy()
+        # 选择四分类模型的特征列
+        four_class_features = df[four_class_feature_names].copy()
         
         # 处理缺失值和异常值
-        X_pred = X_pred.replace([np.inf, -np.inf], np.nan)
-        X_pred = X_pred.fillna(0.0)
+        four_class_features = four_class_features.replace([np.inf, -np.inf], np.nan)
+        four_class_features = four_class_features.fillna(0.0)
         
-        # 如果有多行，取第一行（保持DataFrame格式）
-        if len(X_pred) > 0:
-            features_df = X_pred.iloc[0:1].copy()  # 保持DataFrame格式，只取第一行
+        # 如果有多行，取第一行
+        if len(four_class_features) > 0:
+            four_class_features_df = four_class_features.iloc[0:1].copy()
         else:
             raise ValueError("窗口特征数据为空")
         
-        # 预测概率（二分类：0=安静休息, 1=吃饭喝水）
-        proba = binary_model.predict_proba(features_df)
-        # proba 形状可能是 (1, 2) 或 (1, 1)
-        if proba.shape[1] > 1:
-            prob_eating = proba[0, 1]  # 吃饭喝水的概率
+        # 标准化
+        four_class_features_scaled = four_class_scaler.transform(four_class_features_df)
+        
+        # 四分类模型预测
+        four_class_predicted = four_class_model.predict(four_class_features_scaled)[0]
+        four_class_proba = four_class_model.predict_proba(four_class_features_scaled)[0]
+        four_class_max_proba = four_class_proba.max()
+        
+        # 应用置信度阈值
+        if four_class_max_proba >= four_class_confidence_threshold:
+            four_class_final = four_class_predicted
         else:
-            prob_eating = proba[0, 0]  # 如果只有一列，使用该列
+            four_class_final = "玩耍捕猎"
         
-        # 使用阈值进行预测
-        predicted_label = 1 if prob_eating >= prediction_threshold else 0
-        predicted_action = LABEL_MAP[predicted_label]
+        logger.info(f"第一层（四分类）预测: {four_class_final}, 置信度: {four_class_max_proba:.2%}")
         
-        # 计算置信度（使用概率值）
-        confidence = float(prob_eating) if predicted_label == 1 else float(1.0 - prob_eating)
+        # ===== 判断是否需要第二层推理 =====
+        if four_class_final == "安静休息":
+            # 需要第二层推理：使用二分类模型
+            if binary_model is None:
+                logger.warning("二分类模型未加载，使用四分类模型的结果")
+                final_action = "安静休息"
+                final_confidence = float(four_class_max_proba)
+            else:
+                # 准备二分类模型的特征
+                for col in feature_names:
+                    if col not in df.columns:
+                        logger.warning(f"二分类模型特征列 {col} 不存在，将填充为0")
+                        df[col] = 0.0
+                
+                # 选择二分类模型的特征列
+                binary_features = df[feature_names].copy()
+                
+                # 处理缺失值和异常值
+                binary_features = binary_features.replace([np.inf, -np.inf], np.nan)
+                binary_features = binary_features.fillna(0.0)
+                
+                # 如果有多行，取第一行
+                if len(binary_features) > 0:
+                    binary_features_df = binary_features.iloc[0:1].copy()
+                else:
+                    raise ValueError("二分类特征数据为空")
+                
+                # 二分类模型预测
+                binary_proba = binary_model.predict_proba(binary_features_df)
+                if binary_proba.shape[1] > 1:
+                    prob_eating = binary_proba[0, 1]  # 吃饭喝水的概率
+                else:
+                    prob_eating = binary_proba[0, 0]
+                
+                # 使用阈值进行预测
+                binary_predicted_label = 1 if prob_eating >= prediction_threshold else 0
+                binary_predicted_action = LABEL_MAP[binary_predicted_label]
+                
+                # 计算置信度
+                binary_confidence = float(prob_eating) if binary_predicted_label == 1 else float(1.0 - prob_eating)
+                
+                final_action = binary_predicted_action
+                final_confidence = binary_confidence
+                
+                logger.info(f"第二层（二分类）预测: {final_action}, 置信度: {binary_confidence:.2%}, Prob(吃饭): {prob_eating:.2%}")
+        else:
+            # 直接使用四分类模型的结果
+            final_action = four_class_final
+            final_confidence = float(four_class_max_proba)
+            logger.info(f"直接使用四分类结果: {final_action}, 置信度: {final_confidence:.2%}")
+        
+        # 输出映射：简化类别名称
+        action_mapping = {
+            "玩耍捕猎": "玩耍",
+            "缓慢走动": "走动"
+        }
+        mapped_action = action_mapping.get(final_action, final_action)
         
         result = {
-            "action": predicted_action,
-            "confidence": confidence,
-            "prob_eating": float(prob_eating),
-            "prob_resting": float(1.0 - prob_eating),
-            "predicted_label": predicted_label,
+            "action": mapped_action,
+            "confidence": final_confidence,
+            "original_prediction": final_action,
+            "four_class_prediction": four_class_final,
+            "four_class_confidence": float(four_class_max_proba),
+            "used_binary_model": four_class_final == "安静休息" and binary_model is not None,
             "status": "success"
         }
         
-        logger.info(f"二分类模型推理成功 - Action: {predicted_action}, Confidence: {confidence:.2%}, Prob(吃饭): {prob_eating:.2%}")
+        if result["used_binary_model"]:
+            result["binary_prob_eating"] = float(prob_eating)
+            result["binary_prob_resting"] = float(1.0 - prob_eating)
+        
+        logger.info(f"嵌套模型推理成功 - 最终结果: {mapped_action} (原始: {final_action}), 置信度: {final_confidence:.2%}")
         return result
         
     except Exception as e:
@@ -1349,7 +1482,9 @@ if __name__ == "__main__":
     logger.info("AI 模型服务 - Redis Stream 消费者模式")
     logger.info("=" * 60)
     logger.info(f"环境: {ENV}")
-    logger.info(f"二分类模型（吃饭喝水 vs 安静休息）: {'已加载' if binary_model is not None else '未加载'}")
+    logger.info(f"嵌套模型状态:")
+    logger.info(f"  - 第一层（四分类）: {'已加载' if four_class_model is not None else '未加载'}")
+    logger.info(f"  - 第二层（二分类）: {'已加载' if binary_model is not None else '未加载'}")
     logger.info(f"Redis 服务器: {REDIS_HOST}:{REDIS_PORT}")
     logger.info(f"Redis Stream: {REDIS_STREAM_TELEMETRY}")
     logger.info(f"Consumer Group: {REDIS_STREAM_CONSUMER_GROUP}")
