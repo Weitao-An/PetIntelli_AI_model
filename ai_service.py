@@ -24,7 +24,7 @@ TEMP_DIR.mkdir(exist_ok=True)
 
 # 模型路径配置（新四分类模型）
 # 优先级：1. 环境变量 2. 服务器路径 3. 父目录下的deployment文件夹 4. 当前目录下的deployment文件夹
-_deployment_server_dir = Path("/home/Drame/Analysis/deployment")
+_deployment_server_dir = Path("/home/Drame/Analysis/20260128")
 _deployment_parent_dir = Path(__file__).parent.parent / "deployment"
 _deployment_current_dir = Path(__file__).parent / "deployment"
 if os.getenv("DEPLOYMENT_MODEL_DIR"):
@@ -36,7 +36,7 @@ elif _deployment_parent_dir.exists():
 elif _deployment_current_dir.exists():
     DEPLOYMENT_MODEL_DIR = _deployment_current_dir
 else:
-    DEPLOYMENT_MODEL_DIR = Path(os.getenv("DEPLOYMENT_MODEL_DIR", "/home/Drame/Analysis/deployment"))
+    DEPLOYMENT_MODEL_DIR = Path(os.getenv("DEPLOYMENT_MODEL_DIR", "/home/Drame/Analysis/20260128"))
 
 # --- 环境配置（参考 constants.py 规范）---
 ENV = os.getenv("ENV", "dev")  # 环境标识：dev/test/prod

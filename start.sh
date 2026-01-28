@@ -30,14 +30,14 @@ export LOG_LEVEL=${LOG_LEVEL:-INFO}
 # 优先级：1. 环境变量 2. 服务器路径 3. 父目录下的deployment文件夹 4. 当前目录下的deployment文件夹
 if [ -n "$DEPLOYMENT_MODEL_DIR" ]; then
     export DEPLOYMENT_MODEL_DIR="$DEPLOYMENT_MODEL_DIR"
-elif [ -d "/home/Drame/Analysis/deployment" ]; then
-    export DEPLOYMENT_MODEL_DIR="/home/Drame/Analysis/deployment"
+elif [ -d "/home/Drame/Analysis/20260128" ]; then
+    export DEPLOYMENT_MODEL_DIR="/home/Drame/Analysis/20260128"
 elif [ -d "$SCRIPT_DIR/../deployment" ]; then
     export DEPLOYMENT_MODEL_DIR="$(cd "$SCRIPT_DIR/../deployment" && pwd)"
 elif [ -d "$SCRIPT_DIR/deployment" ]; then
     export DEPLOYMENT_MODEL_DIR="$SCRIPT_DIR/deployment"
 else
-    export DEPLOYMENT_MODEL_DIR="/home/Drame/Analysis/deployment"
+    export DEPLOYMENT_MODEL_DIR="/home/Drame/Analysis/20260128"
 fi
 
 # 创建必要的目录

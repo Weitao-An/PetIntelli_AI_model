@@ -17,7 +17,7 @@ Environment="REDIS_PASSWORD=petpypkj2025"
 Environment="REDIS_DECODE=False"
 Environment="TEMP_DIR=/opt/ai_service/temp"
 Environment="LOG_LEVEL=INFO"
-Environment="DEPLOYMENT_MODEL_DIR=/home/Drame/Analysis/deployment"
+Environment="DEPLOYMENT_MODEL_DIR=/home/Drame/Analysis/20260128"
 ExecStart=/opt/ai_service/venv/bin/python3 /opt/ai_service/ai_service.py
 Restart=always
 RestartSec=10
