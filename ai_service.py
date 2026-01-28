@@ -10,6 +10,7 @@ from pathlib import Path
 import os
 from scipy.stats import skew, kurtosis
 import sys
+from sklearn.base import BaseEstimator, ClassifierMixin
 
 # 配置日志
 logging.basicConfig(
@@ -22,9 +23,9 @@ logger = logging.getLogger(__name__)
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "temp"))
 TEMP_DIR.mkdir(exist_ok=True)
 
-# 模型路径配置（新四分类模型）
+# 模型路径配置（二分类模型：吃饭喝水 vs 安静休息）
 # 优先级：1. 环境变量 2. 服务器路径 3. 父目录下的deployment文件夹 4. 当前目录下的deployment文件夹
-_deployment_server_dir = Path("/home/Drame/Analysis/20260128")
+_deployment_server_dir = Path("/home/yan/二分类")
 _deployment_parent_dir = Path(__file__).parent.parent / "deployment"
 _deployment_current_dir = Path(__file__).parent / "deployment"
 if os.getenv("DEPLOYMENT_MODEL_DIR"):
@@ -36,7 +37,7 @@ elif _deployment_parent_dir.exists():
 elif _deployment_current_dir.exists():
     DEPLOYMENT_MODEL_DIR = _deployment_current_dir
 else:
-    DEPLOYMENT_MODEL_DIR = Path(os.getenv("DEPLOYMENT_MODEL_DIR", "/home/Drame/Analysis/20260128"))
+    DEPLOYMENT_MODEL_DIR = Path(os.getenv("DEPLOYMENT_MODEL_DIR", "/home/yan/二分类"))
 
 # --- 环境配置（参考 constants.py 规范）---
 ENV = os.getenv("ENV", "dev")  # 环境标识：dev/test/prod
@@ -72,54 +73,176 @@ _MAX_CACHE_SIZE = 10000  # 最大缓存设备数量，防止内存无限增长
 
 
 # --- 2. 加载模型和配置 ---
-# 新四分类模型（RandomForest）
-rf_model = None
-rf_scaler = None
-model_metadata = None
-confidence_threshold = 0.4
-feature_names = None
+# 二分类模型（吃饭喝水 vs 安静休息）
+
+# CatIMUClassifier 类定义（用于 joblib 加载模型）
+class CatIMUClassifier(BaseEstimator, ClassifierMixin):
+    """二分类模型包装类，用于加载训练好的模型"""
+    def __init__(self, model_type='lightgbm', class_weight=None, **kwargs):
+        self.model_type = model_type
+        self.class_weight = class_weight
+        self.kwargs = kwargs
+        self.model = None
+        # 只有在模型不存在时才初始化（避免在加载已训练模型时重新初始化）
+        if self.model is None:
+            self._initialize_model()
+
+    def _initialize_model(self):
+        # Try LightGBM
+        if self.model_type == 'lightgbm':
+            try:
+                import lightgbm as lgb
+                params = {
+                    'n_estimators': 100,
+                    'learning_rate': 0.1,
+                    'num_leaves': 31,
+                    'random_state': 42,
+                    'verbose': -1,
+                    'class_weight': self.class_weight 
+                }
+                params.update(self.kwargs)
+                self.model = lgb.LGBMClassifier(**params)
+                return
+            except ImportError:
+                pass
+
+        # Try XGBoost
+        if self.model_type in ['lightgbm', 'xgboost']:
+            try:
+                import xgboost as xgb
+                params = {
+                    'n_estimators': 100,
+                    'learning_rate': 0.1,
+                    'max_depth': 6,
+                    'random_state': 42,
+                    'verbosity': 0,
+                    'use_label_encoder': False,
+                    'eval_metric': 'logloss'
+                }
+                params.update(self.kwargs)
+                self.model = xgb.XGBClassifier(**params)
+                return
+            except ImportError:
+                pass
+
+        # Fallback to Sklearn's Histogram-based Gradient Boosting
+        try:
+            from sklearn.ensemble import HistGradientBoostingClassifier
+            cw = 'balanced' if self.class_weight == 'balanced' or isinstance(self.class_weight, dict) else None
+            self.model = HistGradientBoostingClassifier(
+                random_state=42, 
+                class_weight=cw,
+                **self.kwargs
+            )
+        except ImportError:
+            # Absolute fallback
+            from sklearn.ensemble import RandomForestClassifier
+            self.model = RandomForestClassifier(random_state=42, class_weight=self.class_weight, **self.kwargs)
+    
+    def __setstate__(self, state):
+        """自定义反序列化方法，避免在加载时重新初始化模型"""
+        # 直接恢复状态，不重新初始化（模型对象已经在序列化时保存）
+        self.__dict__.update(state)
+        # 不需要调用 _initialize_model，因为模型对象已经在序列化时保存了
+
+    def fit(self, X, y, **kwargs):
+        self.model.fit(X, y, **kwargs)
+        if hasattr(self.model, 'classes_'):
+            self.classes_ = self.model.classes_
+        else:
+            self.classes_ = np.unique(y)
+        return self
+
+    def predict(self, X, threshold=0.5):
+        if hasattr(self.model, "predict_proba"):
+            probs = self.model.predict_proba(X)
+            if probs.shape[1] > 1:
+                p1 = probs[:, 1]
+            else:
+                p1 = probs[:, 0]
+            return (p1 >= threshold).astype(int)
+        else:
+            return self.model.predict(X)
+
+    def predict_proba(self, X):
+        return self.model.predict_proba(X)
+    
+    def feature_importances(self):
+        if hasattr(self.model, 'feature_importances_'):
+            return self.model.feature_importances_
+        return None
+
+binary_model = None
+prediction_threshold = 0.5
+feature_names = [
+    'v_pitch_mean', 'v_pitch_min', 'v_pitch_max', 'v_pitch_range', 'v_pitch_std',
+    'v_roll_mean', 'v_roll_std', 'v_roll_range',
+    'v_rms_acc', 'v_sma_linear',
+    'v_peak_freq', 'v_low_freq_en', 'v_spec_entropy',
+    'v_z_zero_cross', 'v_z_jerk_std',
+    'v_yaw_total',
+    'v_corr_xz', 'v_vel_x_max', 'v_vel_z_var',
+    'v_acc_skew', 'v_acc_kurt'
+]
+
+# 标签映射
+LABEL_MAP = {
+    0: "安静休息",
+    1: "吃饭喝水"
+}
 
 try:
     import joblib
     
-    # 加载模型文件
-    model_path = DEPLOYMENT_MODEL_DIR / "rf_model.pkl"
-    scaler_path = DEPLOYMENT_MODEL_DIR / "scaler.pkl"
-    metadata_path = DEPLOYMENT_MODEL_DIR / "model_metadata.json"
-    
-    if not model_path.exists():
-        logger.error(f"模型文件不存在: {model_path}")
-        exit(1)
-    if not scaler_path.exists():
-        logger.error(f"标准化器文件不存在: {scaler_path}")
-        exit(1)
-    if not metadata_path.exists():
-        logger.error(f"元数据文件不存在: {metadata_path}")
+    # 查找模型文件（可能是 .joblib 或 .pkl）
+    model_files = list(DEPLOYMENT_MODEL_DIR.glob("*.joblib")) + list(DEPLOYMENT_MODEL_DIR.glob("*.pkl"))
+    if not model_files:
+        logger.error(f"模型文件不存在，请检查目录: {DEPLOYMENT_MODEL_DIR}")
         exit(1)
     
-    # 加载模型和标准化器
-    rf_model = joblib.load(model_path)
-    rf_scaler = joblib.load(scaler_path)
+    # 使用第一个找到的模型文件
+    model_path = model_files[0]
+    logger.info(f"加载模型文件: {model_path}")
     
-    # 加载元数据
-    with open(metadata_path, 'r', encoding='utf-8') as f:
-        model_metadata = json.load(f)
+    # 加载模型（可能是字典格式，包含 'model' 和 'threshold'）
+    model_bundle = joblib.load(model_path)
     
-    confidence_threshold = model_metadata.get("confidence_threshold", 0.4)
-    feature_names = model_metadata.get("feature_names", [])
+    if isinstance(model_bundle, dict) and 'model' in model_bundle:
+        binary_model = model_bundle['model']
+        prediction_threshold = model_bundle.get('threshold', 0.5)
+        logger.info(f"从模型包中加载模型和阈值: {prediction_threshold}")
+    else:
+        # 如果不是字典格式，直接使用
+        binary_model = model_bundle
+        prediction_threshold = 0.5
+        logger.info("使用默认阈值: 0.5")
     
-    logger.info(f"成功加载四分类模型")
-    logger.info(f"  - 模型类型: {model_metadata.get('model_type', 'Unknown')}")
-    logger.info(f"  - 置信度阈值: {confidence_threshold}")
+    logger.info(f"成功加载二分类模型")
+    logger.info(f"  - 模型类型: {type(binary_model).__name__}")
+    logger.info(f"  - 预测阈值: {prediction_threshold}")
     logger.info(f"  - 特征数量: {len(feature_names)}")
-    logger.info(f"  - 四分类: {model_metadata.get('four_classes', [])}")
+    logger.info(f"  - 分类: {list(LABEL_MAP.values())}")
+    logger.info(f"  - 模型路径: {DEPLOYMENT_MODEL_DIR}")
     
 except ImportError as e:
-    logger.error(f"缺少必要的依赖库: {e}")
-    logger.error("请确保已安装: joblib, scikit-learn")
+    error_msg = str(e)
+    if 'lightgbm' in error_msg.lower():
+        logger.error(f"缺少必要的依赖库: {e}")
+        logger.error("模型使用 LightGBM 训练，请安装 lightgbm: pip install lightgbm")
+    elif 'xgboost' in error_msg.lower():
+        logger.error(f"缺少必要的依赖库: {e}")
+        logger.error("模型使用 XGBoost 训练，请安装 xgboost: pip install xgboost")
+    else:
+        logger.error(f"缺少必要的依赖库: {e}")
+        logger.error("请确保已安装: joblib, scikit-learn")
     exit(1)
 except Exception as e:
-    logger.error(f"模型加载失败: {e}", exc_info=True)
+    error_msg = str(e)
+    if 'lightgbm' in error_msg.lower() or 'No module named' in error_msg:
+        logger.error(f"模型加载失败: {e}")
+        logger.error("提示: 模型使用 LightGBM 训练，请安装 lightgbm: pip install lightgbm")
+    else:
+        logger.error(f"模型加载失败: {e}", exc_info=True)
     exit(1)
 
 # --- 4. IMU数据转换函数 ---
@@ -522,7 +645,7 @@ def convert_csv_to_virtual_features(csv_path: Path) -> Tuple[pd.DataFrame, pd.Da
 # --- 5. 推理函数 ---
 def perform_inference_from_dataframes(timestamp_df: pd.DataFrame, window_df: pd.DataFrame) -> Dict[str, Any]:
     """
-    直接从DataFrame执行推理（使用新的四分类RandomForest模型）
+    直接从DataFrame执行推理（使用二分类模型：吃饭喝水 vs 安静休息）
     
     Args:
         timestamp_df: per_timestamp特征DataFrame（未使用，保留兼容性）
@@ -531,7 +654,7 @@ def perform_inference_from_dataframes(timestamp_df: pd.DataFrame, window_df: pd.
     Returns:
         包含推理结果的字典
     """
-    if rf_model is None or rf_scaler is None:
+    if binary_model is None:
         return {
             "action": "error",
             "confidence": 0.0,
@@ -546,52 +669,46 @@ def perform_inference_from_dataframes(timestamp_df: pd.DataFrame, window_df: pd.
         for col in feature_names:
             if col not in df.columns:
                 logger.warning(f"特征列 {col} 不存在，将填充为0")
-                df[col] = 0
+                df[col] = 0.0
         
         # 选择特征列（按模型期望的顺序）
-        df = df[feature_names]
+        X_pred = df[feature_names].copy()
         
         # 处理缺失值和异常值
-        df = df.replace([np.inf, -np.inf], np.nan)
-        df = df.fillna(df.mean() if len(df) > 0 else 0)
+        X_pred = X_pred.replace([np.inf, -np.inf], np.nan)
+        X_pred = X_pred.fillna(0.0)
         
         # 如果有多行，取第一行（保持DataFrame格式）
-        if len(df) > 0:
-            features_df = df.iloc[0:1].copy()  # 保持DataFrame格式，只取第一行
+        if len(X_pred) > 0:
+            features_df = X_pred.iloc[0:1].copy()  # 保持DataFrame格式，只取第一行
         else:
             raise ValueError("窗口特征数据为空")
         
-        # 标准化（传入DataFrame以避免警告）
-        features_scaled = rf_scaler.transform(features_df)
-        
-        # 预测
-        predicted_three_class = rf_model.predict(features_scaled)[0]
-        proba = rf_model.predict_proba(features_scaled)[0]
-        max_proba = proba.max()
-        
-        # 应用置信度阈值
-        # 如果置信度低于阈值，归入"玩耍捕猎"类别
-        if max_proba >= confidence_threshold:
-            final_prediction = predicted_three_class
+        # 预测概率（二分类：0=安静休息, 1=吃饭喝水）
+        proba = binary_model.predict_proba(features_df)
+        # proba 形状可能是 (1, 2) 或 (1, 1)
+        if proba.shape[1] > 1:
+            prob_eating = proba[0, 1]  # 吃饭喝水的概率
         else:
-            final_prediction = "玩耍捕猎"
+            prob_eating = proba[0, 0]  # 如果只有一列，使用该列
         
-        # 输出映射：简化类别名称
-        action_mapping = {
-            "玩耍捕猎": "玩耍",
-            "缓慢走动": "走动"
-        }
-        mapped_action = action_mapping.get(final_prediction, final_prediction)
+        # 使用阈值进行预测
+        predicted_label = 1 if prob_eating >= prediction_threshold else 0
+        predicted_action = LABEL_MAP[predicted_label]
+        
+        # 计算置信度（使用概率值）
+        confidence = float(prob_eating) if predicted_label == 1 else float(1.0 - prob_eating)
         
         result = {
-            "action": mapped_action,
-            "confidence": float(max_proba),
-            "original_prediction": predicted_three_class,
-            "all_probabilities": {cls: float(prob) for cls, prob in zip(model_metadata["three_classes"], proba)},
+            "action": predicted_action,
+            "confidence": confidence,
+            "prob_eating": float(prob_eating),
+            "prob_resting": float(1.0 - prob_eating),
+            "predicted_label": predicted_label,
             "status": "success"
         }
         
-        logger.info(f"四分类模型推理成功 - Action: {mapped_action} (原始: {final_prediction}), Confidence: {max_proba:.2%}, Original: {predicted_three_class}")
+        logger.info(f"二分类模型推理成功 - Action: {predicted_action}, Confidence: {confidence:.2%}, Prob(吃饭): {prob_eating:.2%}")
         return result
         
     except Exception as e:
@@ -605,7 +722,7 @@ def perform_inference_from_dataframes(timestamp_df: pd.DataFrame, window_df: pd.
 
 def perform_inference_from_csvs(timestamp_csv_path: Path, window_csv_path: Path) -> Dict[str, Any]:
     """
-    从两个CSV文件执行推理（使用新的四分类RandomForest模型）
+    从两个CSV文件执行推理（使用二分类模型：吃饭喝水 vs 安静休息）
     
     Args:
         timestamp_csv_path: per_timestamp特征CSV文件路径（未使用，保留兼容性）
@@ -1232,7 +1349,7 @@ if __name__ == "__main__":
     logger.info("AI 模型服务 - Redis Stream 消费者模式")
     logger.info("=" * 60)
     logger.info(f"环境: {ENV}")
-    logger.info(f"四分类RandomForest模型: {'已加载' if rf_model is not None else '未加载'}")
+    logger.info(f"二分类模型（吃饭喝水 vs 安静休息）: {'已加载' if binary_model is not None else '未加载'}")
     logger.info(f"Redis 服务器: {REDIS_HOST}:{REDIS_PORT}")
     logger.info(f"Redis Stream: {REDIS_STREAM_TELEMETRY}")
     logger.info(f"Consumer Group: {REDIS_STREAM_CONSUMER_GROUP}")

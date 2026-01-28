@@ -26,18 +26,18 @@ export REDIS_DECODE=${REDIS_DECODE:-False}
 export TEMP_DIR=${TEMP_DIR:-$SCRIPT_DIR/temp}
 export LOG_LEVEL=${LOG_LEVEL:-INFO}
 
-# 模型目录配置（四分类RandomForest模型）
+# 模型目录配置（二分类模型：吃饭喝水 vs 安静休息）
 # 优先级：1. 环境变量 2. 服务器路径 3. 父目录下的deployment文件夹 4. 当前目录下的deployment文件夹
 if [ -n "$DEPLOYMENT_MODEL_DIR" ]; then
     export DEPLOYMENT_MODEL_DIR="$DEPLOYMENT_MODEL_DIR"
-elif [ -d "/home/Drame/Analysis/20260128" ]; then
-    export DEPLOYMENT_MODEL_DIR="/home/Drame/Analysis/20260128"
+elif [ -d "/home/yan/二分类" ]; then
+    export DEPLOYMENT_MODEL_DIR="/home/yan/二分类"
 elif [ -d "$SCRIPT_DIR/../deployment" ]; then
     export DEPLOYMENT_MODEL_DIR="$(cd "$SCRIPT_DIR/../deployment" && pwd)"
 elif [ -d "$SCRIPT_DIR/deployment" ]; then
     export DEPLOYMENT_MODEL_DIR="$SCRIPT_DIR/deployment"
 else
-    export DEPLOYMENT_MODEL_DIR="/home/Drame/Analysis/20260128"
+    export DEPLOYMENT_MODEL_DIR="/home/yan/二分类"
 fi
 
 # 创建必要的目录
@@ -53,18 +53,16 @@ fi
 # 检查模型文件
 MODEL_FOUND=false
 
-# 检查四分类模型文件
+# 检查二分类模型文件（.joblib 或 .pkl）
 if [ -d "$DEPLOYMENT_MODEL_DIR" ]; then
-    if [ -f "$DEPLOYMENT_MODEL_DIR/rf_model.pkl" ] && \
-       [ -f "$DEPLOYMENT_MODEL_DIR/scaler.pkl" ] && \
-       [ -f "$DEPLOYMENT_MODEL_DIR/model_metadata.json" ]; then
+    # 查找模型文件
+    MODEL_FILE=$(find "$DEPLOYMENT_MODEL_DIR" -maxdepth 1 -name "*.joblib" -o -name "*.pkl" | head -n 1)
+    if [ -n "$MODEL_FILE" ] && [ -f "$MODEL_FILE" ]; then
         MODEL_FOUND=true
-        echo "✓ 四分类模型文件已找到: $DEPLOYMENT_MODEL_DIR"
+        echo "✓ 二分类模型文件已找到: $MODEL_FILE"
     else
-        echo "错误: 模型文件不完整，请确保以下文件存在："
-        echo "  - $DEPLOYMENT_MODEL_DIR/rf_model.pkl"
-        echo "  - $DEPLOYMENT_MODEL_DIR/scaler.pkl"
-        echo "  - $DEPLOYMENT_MODEL_DIR/model_metadata.json"
+        echo "错误: 模型文件不存在，请确保目录中存在 .joblib 或 .pkl 文件："
+        echo "  - $DEPLOYMENT_MODEL_DIR"
         exit 1
     fi
 else
@@ -74,7 +72,7 @@ fi
 
 # 启动服务
 echo "=========================================="
-echo "启动 AI 模型服务（四分类RandomForest模型）..."
+echo "启动 AI 模型服务（二分类模型：吃饭喝水 vs 安静休息）..."
 echo "环境: $ENV"
 echo "Redis: $REDIS_HOST:$REDIS_PORT"
 echo "模型目录: $DEPLOYMENT_MODEL_DIR"
