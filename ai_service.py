@@ -1,18 +1,13 @@
-import torch
-import torch.nn as nn
 import numpy as np
 import pandas as pd
 import json
 import logging
-import pickle
 import time
 from typing import List, Any, Optional, Dict, Tuple
 import redis
 from datetime import datetime
 from pathlib import Path
 import os
-import tempfile
-from scipy import signal
 from scipy.stats import skew, kurtosis
 import sys
 
@@ -24,52 +19,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- 1. 配置参数 ---
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", "artifacts"))
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "temp"))
 TEMP_DIR.mkdir(exist_ok=True)
 
-# 模型路径配置
-# Kelong模型路径（用于判断快速奔跑/缓慢走动）
-# 优先级：1. 环境变量 2. model_test目录 3. 当前目录下的kelong_artifacts
-_model_test_dir = Path(__file__).parent.parent / "model_test" / "kelong_artifacts"
-_current_kelong_dir = Path(__file__).parent / "kelong_artifacts"
-if os.getenv("KELONG_ARTIFACTS_DIR"):
-    KELONG_ARTIFACTS_DIR = Path(os.getenv("KELONG_ARTIFACTS_DIR"))
-elif _model_test_dir.exists():
-    KELONG_ARTIFACTS_DIR = _model_test_dir
-elif _current_kelong_dir.exists():
-    KELONG_ARTIFACTS_DIR = _current_kelong_dir
+# 模型路径配置（新四分类模型）
+# 优先级：1. 环境变量 2. 服务器路径 3. 父目录下的deployment文件夹 4. 当前目录下的deployment文件夹
+_deployment_server_dir = Path("/home/Drame/Analysis/deployment")
+_deployment_parent_dir = Path(__file__).parent.parent / "deployment"
+_deployment_current_dir = Path(__file__).parent / "deployment"
+if os.getenv("DEPLOYMENT_MODEL_DIR"):
+    DEPLOYMENT_MODEL_DIR = Path(os.getenv("DEPLOYMENT_MODEL_DIR"))
+elif _deployment_server_dir.exists():
+    DEPLOYMENT_MODEL_DIR = _deployment_server_dir
+elif _deployment_parent_dir.exists():
+    DEPLOYMENT_MODEL_DIR = _deployment_parent_dir
+elif _deployment_current_dir.exists():
+    DEPLOYMENT_MODEL_DIR = _deployment_current_dir
 else:
-    KELONG_ARTIFACTS_DIR = Path(os.getenv("KELONG_ARTIFACTS_DIR", "kelong_artifacts"))
-
-# Processed模型路径（用于判断安静休息/吃喝护理）
-# 优先级：1. 环境变量 2. model_test目录 3. 当前目录下的processed_models
-_processed_test_dir = Path(__file__).parent.parent / "model_test" / "processed_models"
-_current_processed_dir = Path(__file__).parent / "processed_models"
-if os.getenv("PROCESSED_MODELS_DIR"):
-    PROCESSED_MODELS_DIR = Path(os.getenv("PROCESSED_MODELS_DIR"))
-elif _processed_test_dir.exists():
-    PROCESSED_MODELS_DIR = _processed_test_dir
-elif _current_processed_dir.exists():
-    PROCESSED_MODELS_DIR = _current_processed_dir
-else:
-    PROCESSED_MODELS_DIR = Path(os.getenv("PROCESSED_MODELS_DIR", "processed_models"))
-
-# 特征列定义
-READ_COLS = [
-    "v_pitch",
-    "v_roll",
-    "v_yaw_rate",
-    "v_linear_acc_x",
-    "v_linear_acc_y",
-    "v_linear_acc_z",
-    "v_z_highpass",
-    "v_jerk_x",
-    "v_jerk_y",
-    "v_jerk_z",
-]
-FEATURE_COLS = READ_COLS + ["v_acc_mag"]
+    DEPLOYMENT_MODEL_DIR = Path(os.getenv("DEPLOYMENT_MODEL_DIR", "/home/Drame/Analysis/deployment"))
 
 # --- 环境配置（参考 constants.py 规范）---
 ENV = os.getenv("ENV", "dev")  # 环境标识：dev/test/prod
@@ -104,169 +71,55 @@ _device_timestamp_cache: Dict[str, int] = {}
 _MAX_CACHE_SIZE = 10000  # 最大缓存设备数量，防止内存无限增长
 
 
-# --- 2. 模型定义 ---
-class SEBlock(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        hidden = max(1, channels // reduction)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Sequential(
-            nn.Conv1d(channels, hidden, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(hidden, channels, kernel_size=1),
-            nn.Sigmoid(),
-        )
-    def forward(self, x):
-        return x * self.fc(self.pool(x))
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, dropout=0.0):
-        super().__init__()
-        padding = kernel_size // 2
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.dropout = nn.Dropout(dropout)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=False)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-        self.se = SEBlock(out_channels)
-        
-        self.shortcut = nn.Identity()
-        if in_channels != out_channels or stride != 1:
-            self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, 1, stride, bias=False),
-                nn.BatchNorm1d(out_channels)
-            )
-
-    def forward(self, x):
-        ident = self.shortcut(x)
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.dropout(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.se(out)
-        return self.relu(out + ident)
-
-class ResNet1D(nn.Module):
-    def __init__(self, in_channels, num_classes, base_channels=128, dropout=0.2):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv1d(in_channels, base_channels, 7, padding=3, bias=False),
-            nn.BatchNorm1d(base_channels),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.layer1 = self._make_layer(base_channels, base_channels, blocks=2, kernel_size=7, stride=1, dropout=dropout)
-        self.layer2 = self._make_layer(base_channels, base_channels * 2, blocks=2, kernel_size=5, stride=2, dropout=dropout)
-        self.layer3 = self._make_layer(base_channels * 2, base_channels * 4, blocks=2, kernel_size=3, stride=2, dropout=dropout)
-
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.classifier = nn.Sequential(
-            nn.Dropout(p=dropout),
-            nn.Linear(base_channels * 4, num_classes),
-        )
-
-    def _make_layer(self, in_channels, out_channels, blocks, kernel_size, stride, dropout):
-        layers = [
-            ResidualBlock(in_channels, out_channels, kernel_size=kernel_size, stride=stride, dropout=dropout),
-        ]
-        for _ in range(1, blocks):
-            layers.append(ResidualBlock(out_channels, out_channels, kernel_size=kernel_size, stride=1, dropout=dropout))
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.pool(x).squeeze(-1)
-        x = self.classifier(x)
-        return x
-
-# --- 3. 加载模型和配置 ---
-# Kelong模型（用于判断快速奔跑/缓慢走动）
-kelong_model = None
-kelong_scaler = None
-kelong_label_map = {}
-kelong_window_size = 125
-
-# Processed模型（用于判断安静休息/吃喝护理）
-processed_model = None
-processed_scaler = None
-processed_selector = None
-processed_label_encoder = None
-processed_feature_cols = None
+# --- 2. 加载模型和配置 ---
+# 新四分类模型（RandomForest）
+rf_model = None
+rf_scaler = None
+model_metadata = None
+confidence_threshold = 0.4
+feature_names = None
 
 try:
-    # 加载Kelong模型
-    kelong_label_map_path = KELONG_ARTIFACTS_DIR / "label_map.pkl"
-    if kelong_label_map_path.exists():
-        with open(kelong_label_map_path, "rb") as f:
-            data = pickle.load(f)
-            kelong_label_map = data.get("index_to_label", {})
-            kelong_num_classes = len(kelong_label_map)
-        
-        # 加载scaler
-        kelong_scaler_path = KELONG_ARTIFACTS_DIR / "scaler_fold0.pkl"
-        if kelong_scaler_path.exists():
-            with open(kelong_scaler_path, "rb") as f:
-                kelong_scaler = pickle.load(f)
-        
-        # 加载模型
-        kelong_model_path = KELONG_ARTIFACTS_DIR / "best_model_fold0.pth"
-        if kelong_model_path.exists():
-            ckpt = torch.load(kelong_model_path, map_location=DEVICE)
-            base_channels = ckpt.get("base_channels", 128)
-            kelong_window_size = ckpt.get("window_size", 125)
-            
-            kelong_model = ResNet1D(
-                in_channels=11, 
-                num_classes=kelong_num_classes, 
-                base_channels=base_channels, 
-                dropout=0.0
-            ).to(DEVICE)
-            kelong_model.load_state_dict(ckpt["model_state_dict"])
-            kelong_model.eval()
-            logger.info(f"成功加载Kelong模型到: {DEVICE}")
-        else:
-            logger.warning("Kelong模型文件不存在，将跳过Kelong模型推理")
-    else:
-        logger.warning("Kelong模型配置不存在，将跳过Kelong模型推理")
+    import joblib
     
-    # 加载Processed模型
-    try:
-        import joblib
-        from sklearn.preprocessing import LabelEncoder
-        
-        processed_model_path = PROCESSED_MODELS_DIR / "processed_2class_model.pkl"
-        processed_scaler_path = PROCESSED_MODELS_DIR / "processed_2class_scaler.pkl"
-        processed_selector_path = PROCESSED_MODELS_DIR / "processed_2class_selector.pkl"
-        processed_le_path = PROCESSED_MODELS_DIR / "processed_2class_le.pkl"
-        processed_cols_path = PROCESSED_MODELS_DIR / "processed_2class_cols.pkl"
-        
-        if all(p.exists() for p in [processed_model_path, processed_scaler_path, 
-                                    processed_selector_path, processed_le_path, processed_cols_path]):
-            processed_model = joblib.load(processed_model_path)
-            processed_scaler = joblib.load(processed_scaler_path)
-            processed_selector = joblib.load(processed_selector_path)
-            processed_label_encoder = joblib.load(processed_le_path)
-            processed_feature_cols = joblib.load(processed_cols_path)
-            logger.info("成功加载Processed模型")
-        else:
-            logger.warning("Processed模型文件不完整，将跳过Processed模型推理")
-    except ImportError:
-        logger.warning("缺少joblib或sklearn，无法加载Processed模型")
-    except Exception as e:
-        logger.warning(f"加载Processed模型失败: {e}")
+    # 加载模型文件
+    model_path = DEPLOYMENT_MODEL_DIR / "rf_model.pkl"
+    scaler_path = DEPLOYMENT_MODEL_DIR / "scaler.pkl"
+    metadata_path = DEPLOYMENT_MODEL_DIR / "model_metadata.json"
     
-    if kelong_model is None and processed_model is None:
-        logger.error("未加载到任何模型，请检查模型文件路径")
+    if not model_path.exists():
+        logger.error(f"模型文件不存在: {model_path}")
         exit(1)
-        
+    if not scaler_path.exists():
+        logger.error(f"标准化器文件不存在: {scaler_path}")
+        exit(1)
+    if not metadata_path.exists():
+        logger.error(f"元数据文件不存在: {metadata_path}")
+        exit(1)
+    
+    # 加载模型和标准化器
+    rf_model = joblib.load(model_path)
+    rf_scaler = joblib.load(scaler_path)
+    
+    # 加载元数据
+    with open(metadata_path, 'r', encoding='utf-8') as f:
+        model_metadata = json.load(f)
+    
+    confidence_threshold = model_metadata.get("confidence_threshold", 0.4)
+    feature_names = model_metadata.get("feature_names", [])
+    
+    logger.info(f"成功加载四分类模型")
+    logger.info(f"  - 模型类型: {model_metadata.get('model_type', 'Unknown')}")
+    logger.info(f"  - 置信度阈值: {confidence_threshold}")
+    logger.info(f"  - 特征数量: {len(feature_names)}")
+    logger.info(f"  - 四分类: {model_metadata.get('four_classes', [])}")
+    
+except ImportError as e:
+    logger.error(f"缺少必要的依赖库: {e}")
+    logger.error("请确保已安装: joblib, scikit-learn")
+    exit(1)
 except Exception as e:
-    logger.error(f"模型加载失败: {e}")
+    logger.error(f"模型加载失败: {e}", exc_info=True)
     exit(1)
 
 # --- 4. IMU数据转换函数 ---
@@ -669,189 +522,94 @@ def convert_csv_to_virtual_features(csv_path: Path) -> Tuple[pd.DataFrame, pd.Da
 # --- 5. 推理函数 ---
 def perform_inference_from_dataframes(timestamp_df: pd.DataFrame, window_df: pd.DataFrame) -> Dict[str, Any]:
     """
-    直接从DataFrame执行推理（避免文件I/O，提升性能）
+    直接从DataFrame执行推理（使用新的四分类RandomForest模型）
     
     Args:
-        timestamp_df: per_timestamp特征DataFrame
-        window_df: per_window特征DataFrame
+        timestamp_df: per_timestamp特征DataFrame（未使用，保留兼容性）
+        window_df: per_window特征DataFrame（用于模型推理）
         
     Returns:
         包含推理结果的字典
     """
-    kelong_result = None
-    processed_result = None
-    
-    # 1. Kelong模型推理（使用per_timestamp特征）
-    if kelong_model is not None and kelong_scaler is not None:
-        try:
-            df = timestamp_df.copy()
-            
-            # 检查必要的列
-            missing = [c for c in READ_COLS if c not in df.columns]
-            if missing:
-                raise ValueError(f"DataFrame缺少必要的列: {missing}")
-            
-            # 提取特征列
-            df_subset = df[READ_COLS].copy()
-            for c in READ_COLS:
-                df_subset[c] = pd.to_numeric(df_subset[c], errors="coerce")
-            
-            # 处理缺失值
-            if df_subset.isna().any().any():
-                df_subset = df_subset.interpolate(method='linear').ffill().bfill()
-                df_subset = df_subset.fillna(0)
-            
-            # 计算加速度幅值
-            acc_x = df_subset["v_linear_acc_x"].to_numpy(dtype=np.float32)
-            acc_y = df_subset["v_linear_acc_y"].to_numpy(dtype=np.float32)
-            acc_z = df_subset["v_linear_acc_z"].to_numpy(dtype=np.float32)
-            acc_mag = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2).reshape(-1, 1)
-            
-            # 合并特征
-            data = df_subset.to_numpy(dtype=np.float32)
-            data = np.concatenate([data, acc_mag], axis=1)
-            
-            # 标准化
-            data_scaled = kelong_scaler.transform(data)
-            
-            # 滑动窗口切片
-            T = data_scaled.shape[0]
-            step = kelong_window_size // 2
-            windows = []
-            
-            if T < kelong_window_size:
-                pad = np.zeros((kelong_window_size - T, 11), dtype=np.float32)
-                w = np.concatenate([data_scaled, pad], axis=0)
-                windows.append(w)
-            else:
-                for start in range(0, T - kelong_window_size + 1, step):
-                    w = data_scaled[start : start + kelong_window_size]
-                    windows.append(w)
-                if T > kelong_window_size and (T - kelong_window_size) % step != 0:
-                    windows.append(data_scaled[-kelong_window_size:])
-            
-            batch_input = np.array(windows)
-            batch_input = np.transpose(batch_input, (0, 2, 1))
-            tensor_input = torch.tensor(batch_input).float().to(DEVICE)
-            
-            # 推理
-            with torch.no_grad():
-                logits = kelong_model(tensor_input)
-                probs = torch.softmax(logits, dim=1)
-                avg_probs = probs.mean(dim=0)
-                pred_idx = torch.argmax(avg_probs).item()
-                confidence = avg_probs[pred_idx].item()
-            
-            # 获取预测标签
-            pred_label = kelong_label_map.get(pred_idx, "unknown")
-            
-            # 4类映射
-            if pred_label in ['大类_快速奔跑']:
-                class_4 = '快速奔跑'
-            elif pred_label in ['大类_缓慢走动']:
-                class_4 = '缓慢走动'
-            else:
-                class_4 = '其他'
-            
-            kelong_result = {
-                "original_label": pred_label,
-                "class_4": class_4,
-                "confidence": float(confidence),
-                "model": "Kelong"
-            }
-            
-            logger.info(f"Kelong模型推理成功 - Class: {class_4}, Confidence: {confidence:.2%}")
-        except Exception as e:
-            logger.warning(f"Kelong模型推理失败: {e}")
-    
-    # 2. Processed模型推理（使用per_window特征）
-    if processed_model is not None and processed_scaler is not None:
-        try:
-            df = window_df.copy()
-            
-            # 确保所有特征列存在
-            for col in processed_feature_cols:
-                if col not in df.columns:
-                    df[col] = 0
-            
-            # 选择特征列
-            df = df[processed_feature_cols]
-            
-            # 处理缺失值和异常值
-            df = df.replace([np.inf, -np.inf], np.nan)
-            df = df.fillna(df.median() if len(df) > 0 else 0)
-            
-            # 如果有多行，取第一行（保持DataFrame格式）
-            if len(df) > 0:
-                features_df = df.iloc[0:1].copy()  # 保持DataFrame格式，只取第一行
-            else:
-                raise ValueError("窗口特征数据为空")
-            
-            # 标准化（传入DataFrame以避免警告）
-            features_scaled = processed_scaler.transform(features_df)
-            
-            # 特征选择
-            features_sel = processed_selector.transform(features_scaled)
-            
-            # 预测
-            pred_idx = processed_model.predict(features_sel)[0]
-            pred_proba = processed_model.predict_proba(features_sel)[0]
-            pred_label = processed_label_encoder.inverse_transform([pred_idx])[0]
-            confidence = pred_proba[pred_idx]
-            
-            processed_result = {
-                "label": pred_label,
-                "confidence": float(confidence),
-                "model": "Processed"
-            }
-            
-            logger.info(f"Processed模型推理成功 - Label: {pred_label}, Confidence: {confidence:.2%}")
-        except Exception as e:
-            logger.warning(f"Processed模型推理失败: {e}")
-    
-    # 3. 混合预测逻辑
-    final_result = None
-    
-    # 如果Kelong预测为"快速奔跑"或"缓慢走动"，直接使用
-    if kelong_result and kelong_result['class_4'] in ['快速奔跑', '缓慢走动']:
-        final_result = {
-            "action": kelong_result['class_4'],
-            "confidence": kelong_result['confidence'],
-            "model_used": "Kelong",
-            "status": "success"
-        }
-    # 否则使用Processed模型
-    elif processed_result:
-        # 将Processed的预测映射到4类
-        if processed_result['label'] == '安静休息':
-            final_class = '安静休息'
-        else:  # 吃喝护理
-            final_class = '吃喝护理'
-        
-        final_result = {
-            "action": final_class,
-            "confidence": processed_result['confidence'],
-            "model_used": "Processed",
-            "status": "success"
-        }
-    else:
-        # 两个模型都失败
-        final_result = {
-            "action": "unknown",
+    if rf_model is None or rf_scaler is None:
+        return {
+            "action": "error",
             "confidence": 0.0,
             "status": "error",
-            "error": "两个模型推理都失败"
+            "error": "模型未加载"
         }
     
-    return final_result
+    try:
+        df = window_df.copy()
+        
+        # 确保所有特征列存在
+        for col in feature_names:
+            if col not in df.columns:
+                logger.warning(f"特征列 {col} 不存在，将填充为0")
+                df[col] = 0
+        
+        # 选择特征列（按模型期望的顺序）
+        df = df[feature_names]
+        
+        # 处理缺失值和异常值
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.fillna(df.mean() if len(df) > 0 else 0)
+        
+        # 如果有多行，取第一行（保持DataFrame格式）
+        if len(df) > 0:
+            features_df = df.iloc[0:1].copy()  # 保持DataFrame格式，只取第一行
+        else:
+            raise ValueError("窗口特征数据为空")
+        
+        # 标准化（传入DataFrame以避免警告）
+        features_scaled = rf_scaler.transform(features_df)
+        
+        # 预测
+        predicted_three_class = rf_model.predict(features_scaled)[0]
+        proba = rf_model.predict_proba(features_scaled)[0]
+        max_proba = proba.max()
+        
+        # 应用置信度阈值
+        # 如果置信度低于阈值，归入"玩耍捕猎"类别
+        if max_proba >= confidence_threshold:
+            final_prediction = predicted_three_class
+        else:
+            final_prediction = "玩耍捕猎"
+        
+        # 输出映射：简化类别名称
+        action_mapping = {
+            "玩耍捕猎": "玩耍",
+            "缓慢走动": "走动"
+        }
+        mapped_action = action_mapping.get(final_prediction, final_prediction)
+        
+        result = {
+            "action": mapped_action,
+            "confidence": float(max_proba),
+            "original_prediction": predicted_three_class,
+            "all_probabilities": {cls: float(prob) for cls, prob in zip(model_metadata["three_classes"], proba)},
+            "status": "success"
+        }
+        
+        logger.info(f"四分类模型推理成功 - Action: {mapped_action} (原始: {final_prediction}), Confidence: {max_proba:.2%}, Original: {predicted_three_class}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"推理失败: {e}", exc_info=True)
+        return {
+            "action": "error",
+            "confidence": 0.0,
+            "status": "error",
+            "error": str(e)
+        }
 
 def perform_inference_from_csvs(timestamp_csv_path: Path, window_csv_path: Path) -> Dict[str, Any]:
     """
-    从两个CSV文件执行推理（使用Kelong和Processed两个模型）
+    从两个CSV文件执行推理（使用新的四分类RandomForest模型）
     
     Args:
-        timestamp_csv_path: per_timestamp特征CSV文件路径（用于Kelong模型）
-        window_csv_path: per_window特征CSV文件路径（用于Processed模型）
+        timestamp_csv_path: per_timestamp特征CSV文件路径（未使用，保留兼容性）
+        window_csv_path: per_window特征CSV文件路径（用于模型推理）
         
     Returns:
         包含推理结果的字典
@@ -1474,9 +1232,7 @@ if __name__ == "__main__":
     logger.info("AI 模型服务 - Redis Stream 消费者模式")
     logger.info("=" * 60)
     logger.info(f"环境: {ENV}")
-    logger.info(f"模型设备: {DEVICE}")
-    logger.info(f"Kelong模型: {'已加载' if kelong_model is not None else '未加载'}")
-    logger.info(f"Processed模型: {'已加载' if processed_model is not None else '未加载'}")
+    logger.info(f"四分类RandomForest模型: {'已加载' if rf_model is not None else '未加载'}")
     logger.info(f"Redis 服务器: {REDIS_HOST}:{REDIS_PORT}")
     logger.info(f"Redis Stream: {REDIS_STREAM_TELEMETRY}")
     logger.info(f"Consumer Group: {REDIS_STREAM_CONSUMER_GROUP}")
