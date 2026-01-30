@@ -14,6 +14,7 @@ import os
 import tempfile
 from scipy import signal
 from scipy.stats import skew, kurtosis
+from scipy.interpolate import interp1d
 import sys
 
 # 配置日志
@@ -55,6 +56,16 @@ elif _current_processed_dir.exists():
     PROCESSED_MODELS_DIR = _current_processed_dir
 else:
     PROCESSED_MODELS_DIR = Path(os.getenv("PROCESSED_MODELS_DIR", "processed_models"))
+
+# Dog模型路径（用于狗狗行为识别）
+# 优先级：1. 环境变量 2. 当前目录下的朱总的狗狗模型
+_dog_model_dir = Path(__file__).parent / "朱总的狗狗模型"
+if os.getenv("DOG_MODEL_DIR"):
+    DOG_MODEL_DIR = Path(os.getenv("DOG_MODEL_DIR"))
+elif _dog_model_dir.exists():
+    DOG_MODEL_DIR = _dog_model_dir
+else:
+    DOG_MODEL_DIR = Path(os.getenv("DOG_MODEL_DIR", "朱总的狗狗模型"))
 
 # 特征列定义
 READ_COLS = [
@@ -261,7 +272,14 @@ try:
     except Exception as e:
         logger.warning(f"加载Processed模型失败: {e}")
     
-    if kelong_model is None and processed_model is None:
+    # 加载Dog模型（延迟加载，在首次推理时初始化）
+    dog_model_path = DOG_MODEL_DIR / "model_best.pth"
+    if dog_model_path.exists():
+        logger.info(f"找到狗狗模型文件: {dog_model_path}，将在首次推理时加载")
+    else:
+        logger.warning(f"狗狗模型文件不存在: {dog_model_path}，将跳过狗狗模型")
+    
+    if kelong_model is None and processed_model is None and dog_model is None:
         logger.error("未加载到任何模型，请检查模型文件路径")
         exit(1)
         
@@ -667,6 +685,327 @@ def convert_csv_to_virtual_features(csv_path: Path) -> Tuple[pd.DataFrame, pd.Da
     return timestamp_df, window_df
 
 # --- 5. 推理函数 ---
+# Dog模型相关变量
+dog_model = None
+dog_model_path = None
+dog_label_map = {
+    0: "嗅闻",
+    1: "小跑",
+    2: "抖动",
+    3: "摄入",
+    4: "玩耍",
+    5: "行走",
+    6: "静止"
+}
+
+def convert_to_dog_features(timestamp_df: pd.DataFrame, static_features: Optional[Dict[str, float]] = None) -> np.ndarray:
+    """
+    将虚拟坐标系特征转换为狗狗模型需要的16个特征
+    
+    16个特征包括：
+    - 11个动态特征：a_vert, a_hor, cos_theta_a, sin_theta_a, w_vert, w_hor, cos_theta_w, sin_theta_w, pitch, roll, is_static
+    - 5个静态特征：Breed, Weight, Age months, Gender, NeuteringStatus
+    
+    Args:
+        timestamp_df: per_timestamp特征DataFrame（包含虚拟坐标系特征）
+        static_features: 静态特征字典（可选，如果为None则使用默认值）
+        
+    Returns:
+        numpy数组，形状为 (T, 16)，T为时间步数
+    """
+    T = len(timestamp_df)
+    
+    # 提取虚拟坐标系特征
+    v_linear_acc_x = timestamp_df['v_linear_acc_x'].values
+    v_linear_acc_y = timestamp_df['v_linear_acc_y'].values
+    v_linear_acc_z = timestamp_df['v_linear_acc_z'].values
+    v_pitch = timestamp_df['v_pitch'].values
+    v_roll = timestamp_df['v_roll'].values
+    v_yaw_rate = timestamp_df['v_yaw_rate'].values
+    
+    # 计算加速度幅值
+    acc_mag = np.sqrt(v_linear_acc_x**2 + v_linear_acc_y**2 + v_linear_acc_z**2)
+    
+    # 1. a_vert: 垂直方向加速度（z轴，向下为正）
+    a_vert = -v_linear_acc_z  # 注意：虚拟坐标系中z向下为正，重力对齐坐标系中也是向下为正
+    
+    # 2. a_hor: 水平方向加速度幅值
+    a_hor = np.sqrt(v_linear_acc_x**2 + v_linear_acc_y**2)
+    
+    # 3. cos_theta_a, sin_theta_a: 加速度方向角
+    # theta_a = atan2(a_hor, a_vert) 或类似的角度
+    # 这里使用加速度在水平面的方向角
+    theta_a = np.arctan2(v_linear_acc_y, v_linear_acc_x)
+    cos_theta_a = np.cos(theta_a)
+    sin_theta_a = np.sin(theta_a)
+    
+    # 4. w_vert: 垂直方向角速度（yaw_rate，绕垂直轴旋转）
+    w_vert = v_yaw_rate
+    
+    # 5. w_hor: 水平方向角速度幅值（pitch和roll的合成）
+    # 从pitch和roll的变化率计算水平角速度
+    # 简化处理：使用pitch和roll的导数的合成
+    if T > 1:
+        dt = np.diff(timestamp_df['timestamp'].values)
+        dt = np.concatenate([[dt[0] if len(dt) > 0 else 0.04], dt])
+        dt = np.clip(dt, 0.001, 1.0)
+        
+        pitch_rate = np.zeros_like(v_pitch)
+        roll_rate = np.zeros_like(v_roll)
+        pitch_rate[1:] = np.diff(v_pitch) / dt[1:]
+        roll_rate[1:] = np.diff(v_roll) / dt[1:]
+        
+        w_hor = np.sqrt(pitch_rate**2 + roll_rate**2)
+    else:
+        w_hor = np.zeros(T)
+    
+    # 6. cos_theta_w, sin_theta_w: 角速度方向角
+    if T > 1:
+        theta_w = np.arctan2(roll_rate, pitch_rate)
+        cos_theta_w = np.cos(theta_w)
+        sin_theta_w = np.sin(theta_w)
+    else:
+        cos_theta_w = np.ones(T)
+        sin_theta_w = np.zeros(T)
+    
+    # 7. pitch, roll: 直接使用虚拟坐标系的pitch和roll
+    pitch = v_pitch
+    roll = v_roll
+    
+    # 8. is_static: 是否静止（基于加速度幅值判断）
+    # 如果加速度幅值接近1g（重力），且变化很小，认为是静止
+    static_threshold = 0.2  # 加速度变化阈值
+    acc_mag_mean = np.mean(acc_mag)
+    acc_mag_std = np.std(acc_mag)
+    is_static = ((acc_mag_mean < 1.2) & (acc_mag_mean > 0.8) & (acc_mag_std < static_threshold)).astype(float)
+    is_static = np.full(T, is_static)  # 扩展到所有时间步
+    
+    # 静态特征（5个）
+    if static_features is None:
+        # 使用默认值
+        breed = 11.72  # 默认品种ID（基于文档中的均值）
+        weight = 23.83  # 默认体重（kg）
+        age_months = 57.65  # 默认年龄（月）
+        gender = 1.48  # 默认性别编码
+        neutering_status = 0.35  # 默认绝育状态
+    else:
+        breed = static_features.get('breed', 11.72)
+        weight = static_features.get('weight', 23.83)
+        age_months = static_features.get('age_months', 57.65)
+        gender = static_features.get('gender', 1.48)
+        neutering_status = static_features.get('neutering_status', 0.35)
+    
+    # 组合所有特征 (T, 16)
+    features = np.column_stack([
+        a_vert,           # 0: a_vert
+        a_hor,            # 1: a_hor
+        cos_theta_a,      # 2: cos_theta_a
+        sin_theta_a,      # 3: sin_theta_a
+        w_vert,           # 4: w_vert
+        w_hor,            # 5: w_hor
+        cos_theta_w,      # 6: cos_theta_w
+        sin_theta_w,      # 7: sin_theta_w
+        pitch,            # 8: pitch
+        roll,             # 9: roll
+        is_static,        # 10: is_static
+        np.full(T, breed),           # 11: Breed (静态，所有时间步相同)
+        np.full(T, weight),          # 12: Weight (静态)
+        np.full(T, age_months),      # 13: Age months (静态)
+        np.full(T, gender),          # 14: Gender (静态)
+        np.full(T, neutering_status) # 15: NeuteringStatus (静态)
+    ])
+    
+    return features.astype(np.float32)
+
+def expand_time_series(data: np.ndarray, target_length: int = 500) -> np.ndarray:
+    """
+    将时间序列从当前长度扩展到目标长度（使用线性插值）
+    
+    Args:
+        data: 输入数据，形状为 (T, C)，T为时间步，C为通道数
+        target_length: 目标时间步长度
+        
+    Returns:
+        扩展后的数据，形状为 (target_length, C)
+    """
+    T, C = data.shape
+    
+    if T == target_length:
+        return data
+    elif T > target_length:
+        # 如果输入更长，进行下采样（使用线性插值）
+        indices = np.linspace(0, T - 1, target_length)
+        result = np.zeros((target_length, C), dtype=data.dtype)
+        for c in range(C):
+            f = interp1d(np.arange(T), data[:, c], kind='linear', fill_value='extrapolate')
+            result[:, c] = f(indices)
+        return result
+    else:
+        # 如果输入更短，进行上采样（使用线性插值）
+        indices = np.linspace(0, T - 1, target_length)
+        result = np.zeros((target_length, C), dtype=data.dtype)
+        for c in range(C):
+            f = interp1d(np.arange(T), data[:, c], kind='linear', fill_value='extrapolate')
+            result[:, c] = f(indices)
+        return result
+
+def _load_dog_model():
+    """
+    延迟加载狗狗模型（在首次推理时调用）
+    
+    Returns:
+        加载的模型对象，如果失败返回None
+    """
+    global dog_model, dog_model_path
+    
+    if dog_model is not None and not isinstance(dog_model, dict):
+        return dog_model
+    
+    if dog_model_path is None:
+        dog_model_path = DOG_MODEL_DIR / "model_best.pth"
+    
+    if not dog_model_path.exists():
+        logger.error(f"狗狗模型文件不存在: {dog_model_path}")
+        return None
+    
+    try:
+        logger.info(f"正在加载狗狗模型: {dog_model_path}")
+        
+        # 方法1: 尝试作为TorchScript模型加载
+        try:
+            loaded_model = torch.jit.load(str(dog_model_path), map_location=DEVICE)
+            loaded_model.eval()
+            dog_model = loaded_model
+            logger.info("成功加载狗狗模型（TorchScript格式）")
+            return dog_model
+        except:
+            pass  # 不是TorchScript格式，继续尝试其他方法
+        
+        # 方法2: 尝试作为普通checkpoint加载
+        ckpt = torch.load(dog_model_path, map_location=DEVICE)
+        
+        # 如果checkpoint直接是模型对象
+        if isinstance(ckpt, nn.Module):
+            ckpt.eval()
+            dog_model = ckpt
+            logger.info("成功加载狗狗模型（直接模型对象）")
+            return dog_model
+        
+        # 方法3: 尝试从state_dict加载（需要模型结构）
+        if isinstance(ckpt, dict):
+            # 保存checkpoint信息，供后续使用
+            dog_model = {
+                'checkpoint': ckpt,
+                'path': dog_model_path
+            }
+            logger.warning("狗狗模型checkpoint已加载，但需要模型结构定义才能使用")
+            logger.warning("请提供ViT模型类定义，或使用已编译的TorchScript模型")
+            return dog_model
+        else:
+            logger.error(f"狗狗模型文件格式异常: {type(ckpt)}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"加载狗狗模型失败: {e}", exc_info=True)
+        return None
+
+def perform_dog_inference(timestamp_df: pd.DataFrame, window_df: pd.DataFrame, static_features: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """
+    执行狗狗模型推理
+    
+    Args:
+        timestamp_df: per_timestamp特征DataFrame
+        window_df: per_window特征DataFrame（未使用，但保留接口一致性）
+        static_features: 静态特征字典（可选）
+        
+    Returns:
+        包含推理结果的字典
+    """
+    global dog_model
+    
+    # 延迟加载模型
+    if dog_model is None:
+        dog_model = _load_dog_model()
+        if dog_model is None:
+            return {
+                "action": "error",
+                "confidence": 0.0,
+                "model_used": "Dog",
+                "status": "error",
+                "error": "狗狗模型加载失败"
+            }
+    
+    # 如果dog_model是dict（包含checkpoint），说明需要模型结构
+    if isinstance(dog_model, dict):
+        logger.error("狗狗模型需要模型结构定义，当前无法直接推理")
+        logger.error("请提供ViT模型定义或使用已编译的TorchScript模型")
+        return {
+            "action": "error",
+            "confidence": 0.0,
+            "model_used": "Dog",
+            "status": "error",
+            "error": "狗狗模型结构未定义，需要模型类定义"
+        }
+    
+    # 确保模型在eval模式
+    if hasattr(dog_model, 'eval'):
+        dog_model.eval()
+    
+    try:
+        # 1. 将虚拟坐标系特征转换为16个特征
+        features_16 = convert_to_dog_features(timestamp_df, static_features)
+        
+        # 2. 将时间序列从当前长度扩展到500帧
+        # 通常输入是250帧左右，需要扩展到500帧
+        features_500 = expand_time_series(features_16, target_length=500)
+        
+        # 3. 转换为模型输入格式 (batch, 500, 16)
+        # 注意：根据文档，可能是 (batch, 500, 16) 或 (batch, 16, 500)
+        # 先尝试 (batch, 500, 16) 格式
+        input_tensor = torch.from_numpy(features_500).unsqueeze(0).float().to(DEVICE)  # (1, 500, 16)
+        
+        # 4. 执行推理
+        dog_model.eval()
+        with torch.no_grad():
+            try:
+                output = dog_model(input_tensor)
+            except RuntimeError as e:
+                # 如果形状不对，尝试转置 (batch, 16, 500)
+                if "size" in str(e).lower() or "shape" in str(e).lower():
+                    logger.debug(f"尝试转置输入形状: {e}")
+                    input_tensor = input_tensor.transpose(1, 2)  # (1, 16, 500)
+                    output = dog_model(input_tensor)
+                else:
+                    raise
+        
+        # 5. 获取预测结果
+        probs = torch.softmax(output, dim=-1)
+        pred_idx = torch.argmax(probs, dim=-1).item()
+        confidence = probs[0, pred_idx].item()
+        
+        # 6. 映射到类别名称
+        pred_label = dog_label_map.get(pred_idx, "unknown")
+        
+        logger.info(f"狗狗模型推理成功 - Label: {pred_label}, Confidence: {confidence:.2%}")
+        
+        return {
+            "action": pred_label,
+            "confidence": float(confidence),
+            "model_used": "Dog",
+            "status": "success",
+            "pred_idx": int(pred_idx)
+        }
+        
+    except Exception as e:
+        logger.error(f"狗狗模型推理失败: {e}", exc_info=True)
+        return {
+            "action": "error",
+            "confidence": 0.0,
+            "model_used": "Dog",
+            "status": "error",
+            "error": str(e)
+        }
+
 def perform_inference_from_dataframes(timestamp_df: pd.DataFrame, window_df: pd.DataFrame) -> Dict[str, Any]:
     """
     直接从DataFrame执行推理（避免文件I/O，提升性能）
@@ -1160,21 +1499,28 @@ def process_stream_message(message_data: dict) -> Optional[dict]:
         nfc_uid = message_data.get("nfc_uid", nfc_uid)
         dev_ts_ms = message_data.get("dev_ts_ms", dev_ts_ms)
         
+        # 检查 species 字段（在最外层，优先从顶层获取）
+        species = message_data.get("species", "").lower() if message_data.get("species") else ""
+        
         # 检查是否有 data 字段（JSON 字符串格式）
         # 根据之前的日志，items 数组在 data 字段里面
         data_str = message_data.get("data", None)
+        parsed_data = None  # 保存解析后的data，供后续使用
         if data_str:
             # data 字段存在，需要解析它
             try:
                 if isinstance(data_str, str):
-                    data = json.loads(data_str)
+                    parsed_data = json.loads(data_str)
                 else:
-                    data = data_str
+                    parsed_data = data_str
                 
                 # 从解析后的 data 中获取 items 和 dev_ts_ms
-                items = data.get("items", [])
+                items = parsed_data.get("items", [])
                 # 更新 dev_ts_ms（优先使用 data 中的值）
-                dev_ts_ms = data.get("dev_ts_ms", dev_ts_ms)
+                dev_ts_ms = parsed_data.get("dev_ts_ms", dev_ts_ms)
+                # 如果顶层没有 species，尝试从 data 中获取
+                if not species:
+                    species = parsed_data.get("species", "").lower() if parsed_data.get("species") else ""
                 logger.info(f"从 data 字段解析到 Items 数量: {len(items)}")
             except (json.JSONDecodeError, TypeError, AttributeError) as e:
                 logger.error(f"解析 data 字段失败 - NFC UID: {nfc_uid}, Error: {e}")
@@ -1183,6 +1529,9 @@ def process_stream_message(message_data: dict) -> Optional[dict]:
             # 没有 data 字段，直接从顶层获取 items（兼容旧格式）
             items = message_data.get("items", [])
             logger.info(f"从顶层获取 Items 数量: {len(items)}")
+        
+        # 记录检测到的 species
+        logger.info(f"检测到 species: {species if species else '未指定（默认使用猫模型）'} - NFC UID: {nfc_uid}")
         
         # 在解析完所有字段后，检查时间戳（因为dev_ts_ms可能在data字段中）
         # 只对有效的nfc_uid和时间戳进行检查
@@ -1281,9 +1630,44 @@ def process_stream_message(message_data: dict) -> Optional[dict]:
             ai_result["inference_error"] = f"per_window特征计算失败: {str(e)}"
             return ai_result
         
-        # 2.3 执行推理（直接使用DataFrame，避免文件I/O提升性能）
+        # 2.3 执行推理（根据 species 字段选择模型）
         try:
-            inference_result = perform_inference_from_dataframes(timestamp_df, window_df)
+            # 提取静态特征（用于狗狗模型）
+            static_features = None
+            if species == "dog":
+                # 尝试从消息中提取静态特征
+                static_features = {}
+                # 从顶层或已解析的data字段中提取
+                for key in ['breed', 'weight', 'age_months', 'gender', 'neutering_status']:
+                    value = message_data.get(key)
+                    # 如果顶层没有，尝试从已解析的data中获取
+                    if value is None and parsed_data is not None:
+                        value = parsed_data.get(key)
+                    if value is not None:
+                        try:
+                            static_features[key] = float(value)
+                        except (ValueError, TypeError):
+                            pass
+                
+                if not static_features:
+                    logger.debug(f"未找到静态特征，将使用默认值 - NFC UID: {nfc_uid}")
+                else:
+                    logger.debug(f"提取到静态特征: {static_features} - NFC UID: {nfc_uid}")
+            
+            # 根据 species 字段选择使用哪个模型
+            if species == "dog":
+                # 使用狗狗模型
+                logger.info(f"使用狗狗模型进行推理 - NFC UID: {nfc_uid}")
+                inference_result = perform_dog_inference(timestamp_df, window_df, static_features)
+            elif species == "cat" or not species:
+                # 使用原来的模型（cat 或未指定 species 时默认使用原模型）
+                logger.info(f"使用原模型（猫模型）进行推理 - NFC UID: {nfc_uid}")
+                inference_result = perform_inference_from_dataframes(timestamp_df, window_df)
+            else:
+                # 未知的 species，使用原模型并记录警告
+                logger.warning(f"未知的 species: {species}，使用原模型 - NFC UID: {nfc_uid}")
+                inference_result = perform_inference_from_dataframes(timestamp_df, window_df)
+            
             ai_result["action"] = inference_result.get("action", "unknown")
             ai_result["action_confidence"] = inference_result.get("confidence", 0.0)
             
