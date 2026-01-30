@@ -67,6 +67,14 @@ elif _dog_model_dir.exists():
 else:
     DOG_MODEL_DIR = Path(os.getenv("DOG_MODEL_DIR", "朱总的狗狗模型"))
 
+# Cat Emotion模型路径（用于猫情绪识别）
+# 优先级：1. 环境变量 2. 服务器默认路径
+if os.getenv("CAT_EMOTION_MODEL_DIR"):
+    CAT_EMOTION_MODEL_DIR = Path(os.getenv("CAT_EMOTION_MODEL_DIR"))
+else:
+    CAT_EMOTION_MODEL_DIR = Path(os.getenv("CAT_EMOTION_MODEL_DIR", "/home/xzyinpin/cat_emotion_recognition/models/deep_learning"))
+CAT_EMOTION_MODEL_PATH = CAT_EMOTION_MODEL_DIR / "best_model.pth"
+
 # 特征列定义
 READ_COLS = [
     "v_pitch",
@@ -286,6 +294,50 @@ try:
 except Exception as e:
     logger.error(f"模型加载失败: {e}")
     exit(1)
+
+# --- 3.1 猫情绪识别模型定义和加载 ---
+class SimpleMLP(nn.Module):
+    """简单的MLP模型用于猫情绪识别"""
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 512)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.fc3 = nn.Linear(256, 128)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.fc4 = nn.Linear(128, 64)
+        self.bn4 = nn.BatchNorm1d(64)
+        self.fc5 = nn.Linear(64, num_classes)
+        self.dropout = nn.Dropout(0.3)
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        x = self.relu(self.bn1(self.fc1(x)))
+        x = self.dropout(x)
+        x = self.relu(self.bn2(self.fc2(x)))
+        x = self.dropout(x)
+        x = self.relu(self.bn3(self.fc3(x)))
+        x = self.dropout(x)
+        x = self.relu(self.bn4(self.fc4(x)))
+        x = self.dropout(x)
+        x = self.fc5(x)
+        return x
+
+# 猫情绪识别模型（延迟加载）
+cat_emotion_model = None
+cat_emotion_scaler = None
+cat_emotion_feature_selector = None
+cat_emotion_label_map = {
+    0: "平静",
+    1: "高兴",
+    2: "友好/社交",
+    3: "焦虑",
+    4: "恐惧",
+    5: "疼痛/难过"
+}
+cat_emotion_num_classes = 6
+cat_emotion_feature_dim = None  # 将在加载模型时确定
 
 # --- 4. IMU数据转换函数 ---
 def convert_imu_to_virtual_features(imu_data: List[Dict], base_timestamp_ms: int = 0) -> pd.DataFrame:
@@ -1202,10 +1254,344 @@ def perform_inference_from_csvs(timestamp_csv_path: Path, window_csv_path: Path)
     # 调用优化后的函数（避免重复代码）
     return perform_inference_from_dataframes(timestamp_df, window_df)
 
+# --- 5.1 音频处理和猫情绪识别辅助函数 ---
+def download_audio_from_oss(sound_osslink: str, output_path: Path) -> bool:
+    """
+    从OSS下载音频文件
+    
+    Args:
+        sound_osslink: OSS链接路径，例如 "audio/DEVICE_001/2024/12/24/clip_12345.opus"
+        output_path: 本地保存路径
+        
+    Returns:
+        是否下载成功
+    """
+    try:
+        import oss2
+        
+        # OSS配置（从环境变量读取）
+        oss_endpoint = os.getenv("OSS_ENDPOINT", "oss-cn-hangzhou.aliyuncs.com")
+        oss_bucket_name = os.getenv("OSS_BUCKET_NAME", "")
+        oss_access_key_id = os.getenv("OSS_ACCESS_KEY_ID", "")
+        oss_access_key_secret = os.getenv("OSS_ACCESS_KEY_SECRET", "")
+        
+        if not all([oss_bucket_name, oss_access_key_id, oss_access_key_secret]):
+            logger.warning("OSS配置不完整，尝试使用默认配置或直接访问URL")
+            # 如果OSS配置不完整，尝试直接通过HTTP下载（如果OSS支持公开访问）
+            try:
+                import urllib.request
+                # 构建OSS公开访问URL（需要根据实际情况调整）
+                oss_url = f"https://{oss_bucket_name}.{oss_endpoint}/{sound_osslink}"
+                urllib.request.urlretrieve(oss_url, output_path)
+                logger.info(f"通过HTTP下载音频: {oss_url}")
+                return True
+            except Exception as e:
+                logger.error(f"HTTP下载失败: {e}")
+                return False
+        
+        # 使用OSS SDK下载
+        auth = oss2.Auth(oss_access_key_id, oss_access_key_secret)
+        bucket = oss2.Bucket(auth, f"https://{oss_endpoint}", oss_bucket_name)
+        
+        # 确保输出目录存在
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 下载文件
+        bucket.get_object_to_file(sound_osslink, str(output_path))
+        logger.info(f"成功从OSS下载音频: {sound_osslink} -> {output_path}")
+        return True
+        
+    except ImportError:
+        logger.warning("oss2未安装，尝试使用HTTP下载")
+        try:
+            import urllib.request
+            # 重新获取OSS配置
+            oss_endpoint = os.getenv("OSS_ENDPOINT", "oss-cn-hangzhou.aliyuncs.com")
+            oss_bucket_name = os.getenv("OSS_BUCKET_NAME", "")
+            if oss_bucket_name:
+                oss_url = f"https://{oss_bucket_name}.{oss_endpoint}/{sound_osslink}"
+            else:
+                # 如果没有bucket名称，尝试直接使用endpoint
+                oss_url = f"https://{oss_endpoint}/{sound_osslink}"
+            urllib.request.urlretrieve(oss_url, output_path)
+            logger.info(f"通过HTTP下载音频: {oss_url}")
+            return True
+        except Exception as e:
+            logger.error(f"HTTP下载失败: {e}")
+            return False
+    except Exception as e:
+        logger.error(f"从OSS下载音频失败: {e}")
+        return False
+
+def extract_audio_features(audio_path: Path, sample_rate: int = 16000) -> Optional[np.ndarray]:
+    """
+    从音频文件提取特征（MFCC + 谐波特征）
+    
+    Args:
+        audio_path: 音频文件路径
+        sample_rate: 目标采样率
+        
+    Returns:
+        特征向量（numpy数组），如果失败返回None
+    """
+    try:
+        import librosa
+        import soundfile as sf
+        
+        # 加载音频
+        audio, sr = librosa.load(str(audio_path), sr=sample_rate, mono=True)
+        
+        if len(audio) == 0:
+            logger.warning(f"音频文件为空: {audio_path}")
+            return None
+        
+        # 提取MFCC特征
+        n_mfcc = 40
+        mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=n_mfcc, n_fft=2048, hop_length=512)
+        
+        # MFCC统计特征（均值、标准差、最大值、最小值）
+        mfcc_mean = np.mean(mfcc, axis=1)
+        mfcc_std = np.std(mfcc, axis=1)
+        mfcc_max = np.max(mfcc, axis=1)
+        mfcc_min = np.min(mfcc, axis=1)
+        
+        # Delta和Delta-Delta特征
+        mfcc_delta = librosa.feature.delta(mfcc)
+        mfcc_delta2 = librosa.feature.delta(mfcc, order=2)
+        
+        mfcc_delta_mean = np.mean(mfcc_delta, axis=1)
+        mfcc_delta_std = np.std(mfcc_delta, axis=1)
+        mfcc_delta2_mean = np.mean(mfcc_delta2, axis=1)
+        mfcc_delta2_std = np.std(mfcc_delta2, axis=1)
+        
+        # 合并MFCC统计特征
+        mfcc_features = np.concatenate([
+            mfcc_mean, mfcc_std, mfcc_max, mfcc_min,
+            mfcc_delta_mean, mfcc_delta_std,
+            mfcc_delta2_mean, mfcc_delta2_std
+        ])  # 40 * 8 = 320维
+        
+        # 提取谐波特征
+        # 使用librosa提取基频和谐波
+        pitches, magnitudes = librosa.piptrack(y=audio, sr=sr, threshold=0.1)
+        pitch_values = []
+        for t in range(pitches.shape[1]):
+            index = magnitudes[:, t].argmax()
+            pitch = pitches[index, t]
+            if pitch > 0:
+                pitch_values.append(pitch)
+        
+        if len(pitch_values) == 0:
+            pitch_values = [0.0]
+        
+        # F0特征
+        f0_mean = np.mean(pitch_values)
+        f0_std = np.std(pitch_values)
+        f0_max = np.max(pitch_values)
+        f0_min = np.min(pitch_values)
+        f0_median = np.median(pitch_values)
+        
+        # 谐波分析
+        harmonic, percussive = librosa.effects.hpss(audio)
+        
+        # 计算谐波能量
+        harmonic_energy = np.sum(harmonic ** 2)
+        percussive_energy = np.sum(percussive ** 2)
+        total_energy = np.sum(audio ** 2)
+        harmonic_ratio = harmonic_energy / (total_energy + 1e-10)
+        
+        # 提取前几个谐波频率
+        # 使用FFT分析
+        fft = np.fft.rfft(audio)
+        freqs = np.fft.rfftfreq(len(audio), 1.0 / sr)
+        magnitude = np.abs(fft)
+        
+        # 找到前几个峰值（谐波）
+        peak_indices = np.argsort(magnitude)[-10:][::-1]  # 前10个峰值
+        harmonic_freqs = freqs[peak_indices]
+        harmonic_mags = magnitude[peak_indices]
+        
+        # 归一化谐波幅度
+        harmonic_mags_norm = harmonic_mags / (np.sum(harmonic_mags) + 1e-10)
+        
+        # 构建谐波特征向量
+        harmonic_features = np.concatenate([
+            [f0_mean, f0_std, f0_max, f0_min, f0_median],
+            [harmonic_ratio],
+            harmonic_freqs[:5],  # 前5个谐波频率
+            harmonic_mags_norm[:5]  # 前5个谐波幅度
+        ])  # 5 + 1 + 5 + 5 = 16维
+        
+        # 合并所有特征
+        all_features = np.concatenate([mfcc_features, harmonic_features])
+        
+        return all_features.astype(np.float32)
+        
+    except ImportError as e:
+        logger.error(f"缺少必要的音频处理库: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"提取音频特征失败: {e}", exc_info=True)
+        return None
+
+def _load_cat_emotion_model():
+    """
+    延迟加载猫情绪识别模型
+    
+    Returns:
+        是否加载成功
+    """
+    global cat_emotion_model, cat_emotion_scaler, cat_emotion_feature_selector, cat_emotion_feature_dim
+    
+    if cat_emotion_model is not None:
+        return True
+    
+    if cat_emotion_model is not None:
+        return True
+    
+    try:
+        import joblib
+        
+        # 检查模型文件是否存在
+        if not CAT_EMOTION_MODEL_PATH.exists():
+            logger.warning(f"猫情绪识别模型文件不存在: {CAT_EMOTION_MODEL_PATH}")
+            return False
+        
+        # 加载模型
+        logger.info(f"正在加载猫情绪识别模型: {CAT_EMOTION_MODEL_PATH}")
+        model_state = torch.load(CAT_EMOTION_MODEL_PATH, map_location=DEVICE)
+        
+        # 尝试从checkpoint中获取特征维度
+        # 如果checkpoint是state_dict，需要推断特征维度
+        if isinstance(model_state, dict):
+            # 尝试从fc1层的权重推断输入维度
+            if 'fc1.weight' in model_state:
+                cat_emotion_feature_dim = model_state['fc1.weight'].shape[1]
+            else:
+                # 默认特征维度（根据特征提取函数，MFCC 320 + 谐波 16 = 336）
+                cat_emotion_feature_dim = 336
+                logger.warning("无法从模型推断特征维度，使用默认值336")
+        else:
+            cat_emotion_feature_dim = 336
+        
+        # 创建模型
+        cat_emotion_model = SimpleMLP(cat_emotion_feature_dim, cat_emotion_num_classes).to(DEVICE)
+        
+        # 加载权重
+        if isinstance(model_state, dict):
+            if 'model_state_dict' in model_state:
+                cat_emotion_model.load_state_dict(model_state['model_state_dict'])
+            elif 'state_dict' in model_state:
+                cat_emotion_model.load_state_dict(model_state['state_dict'])
+            else:
+                cat_emotion_model.load_state_dict(model_state)
+        else:
+            cat_emotion_model.load_state_dict(model_state)
+        
+        cat_emotion_model.eval()
+        
+        # 尝试加载scaler和feature_selector（如果存在）
+        scaler_path = CAT_EMOTION_MODEL_DIR / "scaler.pkl"
+        selector_path = CAT_EMOTION_MODEL_DIR / "selected_indices.npy"
+        
+        if scaler_path.exists():
+            cat_emotion_scaler = joblib.load(scaler_path)
+            logger.info(f"加载scaler: {scaler_path}")
+        
+        if selector_path.exists():
+            selected_indices = np.load(selector_path)
+            cat_emotion_feature_selector = selected_indices
+            logger.info(f"加载特征选择器: {selector_path}")
+        
+        logger.info(f"成功加载猫情绪识别模型，特征维度: {cat_emotion_feature_dim}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"加载猫情绪识别模型失败: {e}", exc_info=True)
+        return False
+
+def perform_cat_emotion_inference(audio_features: np.ndarray) -> Dict[str, Any]:
+    """
+    执行猫情绪识别推理
+    
+    Args:
+        audio_features: 音频特征向量
+        
+    Returns:
+        包含推理结果的字典
+    """
+    global cat_emotion_model, cat_emotion_scaler, cat_emotion_feature_selector
+    
+    # 延迟加载模型
+    if cat_emotion_model is None:
+        if not _load_cat_emotion_model():
+            return {
+                "emotion": "error",
+                "score": 0,
+                "error": "模型加载失败"
+            }
+    
+    try:
+        # 特征预处理
+        features = audio_features.copy()
+        
+        # 如果特征维度不匹配，尝试调整
+        if len(features) != cat_emotion_feature_dim:
+            logger.warning(f"特征维度不匹配: 期望 {cat_emotion_feature_dim}, 实际 {len(features)}")
+            # 如果实际特征更多，截断；如果更少，填充0
+            if len(features) > cat_emotion_feature_dim:
+                features = features[:cat_emotion_feature_dim]
+            else:
+                padding = np.zeros(cat_emotion_feature_dim - len(features))
+                features = np.concatenate([features, padding])
+        
+        # 标准化
+        if cat_emotion_scaler is not None:
+            features = features.reshape(1, -1)
+            features = cat_emotion_scaler.transform(features)
+            features = features.flatten()
+        
+        # 特征选择
+        if cat_emotion_feature_selector is not None:
+            features = features[cat_emotion_feature_selector]
+        
+        # 转换为tensor
+        features_tensor = torch.from_numpy(features).float().unsqueeze(0).to(DEVICE)
+        
+        # 推理
+        cat_emotion_model.eval()
+        with torch.no_grad():
+            output = cat_emotion_model(features_tensor)
+            probs = torch.softmax(output, dim=-1)
+            pred_idx = torch.argmax(probs, dim=-1).item()
+            confidence = probs[0, pred_idx].item()
+        
+        # 获取情绪标签
+        emotion_label = cat_emotion_label_map.get(pred_idx, "unknown")
+        
+        logger.info(f"猫情绪识别成功 - Label: {emotion_label}, Confidence: {confidence:.2%}")
+        
+        return {
+            "emotion": emotion_label,
+            "score": int(confidence * 100),
+            "pred_idx": int(pred_idx),
+            "confidence": float(confidence)
+        }
+        
+    except Exception as e:
+        logger.error(f"猫情绪识别推理失败: {e}", exc_info=True)
+        return {
+            "emotion": "error",
+            "score": 0,
+            "error": str(e)
+        }
+
 # --- 6. Emotion 处理函数 ---
 def process_emotion(sound_osslink: str) -> dict:
     """
     处理 emotion 数据（通过 sound_osslink 下载和处理音频）
+    
+    当species为cat时，会调用此函数处理音频并识别情绪
     
     Args:
         sound_osslink: 音频 OSS 链接路径，例如 "audio/DEVICE_001/2024/12/24/clip_12345.opus"
@@ -1223,23 +1609,61 @@ def process_emotion(sound_osslink: str) -> dict:
         
         logger.info(f"处理 emotion - OSS Link: {sound_osslink}")
         
-        # TODO: 实现音频下载和处理逻辑
         # 1. 从 OSS 下载音频文件
-        # 2. 调用 emotion 模型处理音频
-        # 3. 返回 emotion 结果
+        # 生成临时文件路径
+        audio_filename = Path(sound_osslink).name
+        # 如果文件名没有扩展名，尝试添加.wav
+        if not audio_filename.endswith(('.wav', '.opus', '.mp3', '.flac', '.ogg')):
+            audio_filename += '.wav'
         
-        # 暂时使用 Mock 返回
-        logger.debug(f"Emotion 处理（Mock）- OSS Link: {sound_osslink}")
-        return {
-            "emotion": "calm",
-            "score": 80
-        }
+        temp_audio_path = TEMP_DIR / f"audio_{int(time.time())}_{audio_filename}"
+        
+        try:
+            # 下载音频
+            download_success = download_audio_from_oss(sound_osslink, temp_audio_path)
+            if not download_success:
+                logger.warning(f"音频下载失败: {sound_osslink}")
+                return {
+                    "emotion": "unknown",
+                    "score": 0,
+                    "error": "音频下载失败"
+                }
+            
+            # 2. 提取音频特征
+            logger.info(f"提取音频特征: {temp_audio_path}")
+            audio_features = extract_audio_features(temp_audio_path)
+            
+            if audio_features is None:
+                logger.warning(f"音频特征提取失败: {temp_audio_path}")
+                return {
+                    "emotion": "unknown",
+                    "score": 0,
+                    "error": "音频特征提取失败"
+                }
+            
+            # 3. 调用猫情绪识别模型
+            logger.info(f"执行猫情绪识别推理，特征维度: {len(audio_features)}")
+            emotion_result = perform_cat_emotion_inference(audio_features)
+            
+            logger.info(f"猫情绪识别完成 - Emotion: {emotion_result.get('emotion')}, Score: {emotion_result.get('score')}")
+            
+            return emotion_result
+            
+        finally:
+            # 清理临时文件
+            try:
+                if temp_audio_path.exists():
+                    temp_audio_path.unlink()
+                    logger.debug(f"已删除临时音频文件: {temp_audio_path}")
+            except Exception as e:
+                logger.warning(f"删除临时音频文件失败: {e}")
         
     except Exception as e:
-        logger.error(f"Emotion 处理失败 - OSS Link: {sound_osslink}, Error: {e}")
+        logger.error(f"Emotion 处理失败 - OSS Link: {sound_osslink}, Error: {e}", exc_info=True)
         return {
             "emotion": "error",
-            "score": 0
+            "score": 0,
+            "error": str(e)
         }
 
 # --- 7. Redis 客户端管理 ---
@@ -1572,22 +1996,36 @@ def process_stream_message(message_data: dict) -> Optional[dict]:
             "inference_timestamp": datetime.now().isoformat()
         }
         
-        # 1. 处理 Emotion（从 audio_meta 中提取 sound_osslink）
+        # 1. 处理 Emotion（仅当species为cat时处理音频）
+        # 从 audio_meta 中提取 sound_osslink
         sound_osslink = ""
         if audio_meta_item:
             audio_v = audio_meta_item.get("v", {})
             sound_osslink = audio_v.get("sound_osslink", "")
         
-        try:
-            emotion_result = process_emotion(sound_osslink)
-            ai_result["emotion_state"] = emotion_result.get("emotion", "calm")
-            ai_result["emotion_score"] = emotion_result.get("score", 80)
-            ai_result["emotion_message"] = f"宠物状态{emotion_result.get('emotion', 'calm')}，情绪评分{emotion_result.get('score', 80)}。"
-        except Exception as e:
-            logger.error(f"Emotion 处理失败 - NFC UID: {nfc_uid}, Error: {e}")
-            ai_result["emotion_state"] = "error"
+        # 只有当species为cat时才处理音频并识别情绪
+        if species == "cat" and sound_osslink:
+            try:
+                logger.info(f"检测到cat species，开始处理音频情绪识别 - NFC UID: {nfc_uid}, OSS Link: {sound_osslink}")
+                emotion_result = process_emotion(sound_osslink)
+                ai_result["emotion_state"] = emotion_result.get("emotion", "unknown")
+                ai_result["emotion_score"] = emotion_result.get("score", 0)
+                ai_result["emotion_message"] = f"宠物状态{emotion_result.get('emotion', 'unknown')}，情绪评分{emotion_result.get('score', 0)}。"
+                logger.info(f"猫情绪识别完成 - NFC UID: {nfc_uid}, Emotion: {ai_result['emotion_state']}, Score: {ai_result['emotion_score']}")
+            except Exception as e:
+                logger.error(f"Emotion 处理失败 - NFC UID: {nfc_uid}, Error: {e}", exc_info=True)
+                ai_result["emotion_state"] = "error"
+                ai_result["emotion_score"] = 0
+                ai_result["emotion_message"] = f"Emotion 处理失败: {str(e)}"
+        else:
+            # 非cat species或没有音频链接，使用默认值
+            if species != "cat":
+                logger.debug(f"species为{species}，跳过音频情绪识别 - NFC UID: {nfc_uid}")
+            elif not sound_osslink:
+                logger.debug(f"未找到sound_osslink，跳过音频情绪识别 - NFC UID: {nfc_uid}")
+            ai_result["emotion_state"] = "unknown"
             ai_result["emotion_score"] = 0
-            ai_result["emotion_message"] = f"Emotion 处理失败: {str(e)}"
+            ai_result["emotion_message"] = "未处理音频情绪识别"
         
         # 2. 处理 IMU 数据（Action 推理）
         if not imu_item:
